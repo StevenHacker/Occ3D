@@ -178,66 +178,98 @@ def _determine_visible_faces(
 
 
 @njit(cache=True)
-def _sample_single_face(
-    face_id: int,
-    half_l: float, half_w: float, half_h: float,
-    n_side: int
-) -> np.ndarray:
+def _compute_face_areas(half_l: float, half_w: float, half_h: float) -> np.ndarray:
     """
-    在单个面上均匀采样
+    计算bbox六个面的面积
     
-    【面的定义】(在bbox局部坐标系)
-    - face 0 (+x): x = +half_l, y ∈ [-half_w, +half_w], z ∈ [-half_h, +half_h]
-    - face 1 (-x): x = -half_l, y ∈ [-half_w, +half_w], z ∈ [-half_h, +half_h]
-    - face 2 (+y): y = +half_w, x ∈ [-half_l, +half_l], z ∈ [-half_h, +half_h]
-    - face 3 (-y): y = -half_w, x ∈ [-half_l, +half_l], z ∈ [-half_h, +half_h]
-    - face 4 (+z): z = +half_h, x ∈ [-half_l, +half_l], y ∈ [-half_w, +half_w]
-    - face 5 (-z): z = -half_h, x ∈ [-half_l, +half_l], y ∈ [-half_w, +half_w]
-    
-    Args:
-        face_id: 面的编号 (0-5)
-        half_l, half_w, half_h: bbox的半长/半宽/半高
-        n_side: 每边的采样数, 总采样数 = n_side^2
+    【各面尺寸】
+    - ±x面 (前后): 宽×高 = (2*half_w) × (2*half_h)
+    - ±y面 (左右): 长×高 = (2*half_l) × (2*half_h)  
+    - ±z面 (顶底): 长×宽 = (2*half_l) × (2*half_w)
     
     Returns:
-        (n_side^2, 3) 的采样点数组 (局部坐标)
+        (6,) 数组，各面面积
     """
-    n_samples = n_side * n_side
-    samples = np.empty((n_samples, 3), dtype=np.float64)
+    areas = np.empty(6, dtype=np.float64)
+    
+    area_x = (2 * half_w) * (2 * half_h)  # 前后面 (宽×高)
+    area_y = (2 * half_l) * (2 * half_h)  # 左右面 (长×高)
+    area_z = (2 * half_l) * (2 * half_w)  # 顶底面 (长×宽)
+    
+    areas[0] = area_x  # +x (前)
+    areas[1] = area_x  # -x (后)
+    areas[2] = area_y  # +y (左)
+    areas[3] = area_y  # -y (右)
+    areas[4] = area_z  # +z (顶)
+    areas[5] = area_z  # -z (底)
+    
+    return areas
+
+
+@njit(cache=True)
+def _sample_single_face_adaptive(
+    face_id: int,
+    half_l: float, half_w: float, half_h: float,
+    n_samples: int
+) -> np.ndarray:
+    """
+    在单个面上自适应采样（根据面的宽高比调整网格）
+    
+    【改进】
+    不是简单的 sqrt(n) × sqrt(n) 网格，
+    而是根据面的宽高比分配行列数，使采样点更均匀。
+    
+    例如: 侧面 4.5m × 1.5m，比例 3:1
+         如果要采样 24 个点，用 6×4 而不是 5×5
+    """
+    # 根据面的编号确定该面的两个维度
+    if face_id == 0 or face_id == 1:    # ±x面: y方向×z方向
+        dim1 = half_w  # y
+        dim2 = half_h  # z
+    elif face_id == 2 or face_id == 3:  # ±y面: x方向×z方向
+        dim1 = half_l  # x
+        dim2 = half_h  # z
+    else:                                # ±z面: x方向×y方向
+        dim1 = half_l  # x
+        dim2 = half_w  # y
+    
+    # 计算宽高比，决定网格的行列数
+    # 目标: n1 * n2 ≈ n_samples, 且 n1/n2 ≈ dim1/dim2
+    ratio = dim1 / dim2 if dim2 > 0.01 else 1.0
+    
+    # n1 * n2 = n_samples
+    # n1 / n2 = ratio
+    # => n1 = sqrt(n_samples * ratio), n2 = sqrt(n_samples / ratio)
+    n1 = int(np.sqrt(n_samples * ratio) + 0.5)
+    n2 = int(np.sqrt(n_samples / ratio) + 0.5)
+    
+    # 确保至少1个
+    if n1 < 1: n1 = 1
+    if n2 < 1: n2 = 1
+    
+    actual_samples = n1 * n2
+    samples = np.empty((actual_samples, 3), dtype=np.float64)
     
     idx = 0
-    for i in range(n_side):
-        for j in range(n_side):
-            # 在[0,1]区间均匀采样，然后映射到[-1,1]
-            # 使用(i+0.5)/n_side而不是i/n_side，避免采样在边缘
-            u = (i + 0.5) / n_side * 2 - 1  # 映射到[-1, 1]
-            v = (j + 0.5) / n_side * 2 - 1
+    for i in range(n1):
+        for j in range(n2):
+            # 在[-1, 1]区间均匀采样
+            u = (i + 0.5) / n1 * 2 - 1
+            v = (j + 0.5) / n2 * 2 - 1
             
             # 根据面的编号确定采样点坐标
             if face_id == 0:    # +x面 (前)
-                lx = half_l
-                ly = u * half_w
-                lz = v * half_h
+                lx, ly, lz = half_l, u * half_w, v * half_h
             elif face_id == 1:  # -x面 (后)
-                lx = -half_l
-                ly = u * half_w
-                lz = v * half_h
+                lx, ly, lz = -half_l, u * half_w, v * half_h
             elif face_id == 2:  # +y面 (左)
-                lx = u * half_l
-                ly = half_w
-                lz = v * half_h
+                lx, ly, lz = u * half_l, half_w, v * half_h
             elif face_id == 3:  # -y面 (右)
-                lx = u * half_l
-                ly = -half_w
-                lz = v * half_h
+                lx, ly, lz = u * half_l, -half_w, v * half_h
             elif face_id == 4:  # +z面 (顶)
-                lx = u * half_l
-                ly = v * half_w
-                lz = half_h
+                lx, ly, lz = u * half_l, v * half_w, half_h
             else:               # -z面 (底)
-                lx = u * half_l
-                ly = v * half_w
-                lz = -half_h
+                lx, ly, lz = u * half_l, v * half_w, -half_h
             
             samples[idx, 0] = lx
             samples[idx, 1] = ly
@@ -253,38 +285,46 @@ def _sample_visible_surfaces(
     half_dims: np.ndarray,
     R: np.ndarray,
     sensor: np.ndarray,
-    n_samples_per_face: int,
+    total_samples: int,
     exclude_bottom: bool
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    在所有可见面上采样
+    在所有可见面上采样（按面积分配采样数）
     
     【流程】
     1. 计算传感器在bbox局部坐标系中的位置
     2. 判断哪些面朝向传感器
-    3. 在每个可见面上均匀采样
-    4. 将采样点从局部坐标转换到世界坐标
+    3. 按面积比例分配采样数（大面多采样，小面少采样）
+    4. 在每个可见面上均匀采样
+    5. 将采样点从局部坐标转换到世界坐标
+    
+    【面积自适应采样】
+    例如车辆 4.5m × 2m × 1.5m:
+    - 侧面 6.75m² → 分配更多采样点
+    - 前面 3.0m²  → 分配较少采样点
+    - 顶面 9.0m²  → 分配最多采样点
     
     Args:
         center: bbox中心 (3,)
         half_dims: [half_length, half_width, half_height]
         R: 旋转矩阵 (3,3), 用于局部→世界
         sensor: 传感器世界坐标 (3,)
-        n_samples_per_face: 每个面的采样数
+        total_samples: 总采样数（会按面积分配到各面）
         exclude_bottom: 是否排除底面
     
     Returns:
         samples: 世界坐标下的采样点 (M, 3)
         face_ids: 每个采样点所属的面编号 (M,)
     """
+    half_l, half_w, half_h = half_dims[0], half_dims[1], half_dims[2]
+    
     # -------- 步骤1: 计算传感器在局部坐标系的位置 --------
-    # R^T @ (sensor - center) 将世界坐标转到局部坐标
     diff = np.empty(3, dtype=np.float64)
     diff[0] = sensor[0] - center[0]
     diff[1] = sensor[1] - center[1]
     diff[2] = sensor[2] - center[2]
     
-    # sensor_local = R^T @ diff (手动矩阵-向量乘法，因为numba不支持@)
+    # sensor_local = R^T @ diff
     sensor_local = np.empty(3, dtype=np.float64)
     for i in range(3):
         sensor_local[i] = R[0, i] * diff[0] + R[1, i] * diff[1] + R[2, i] * diff[2]
@@ -292,41 +332,49 @@ def _sample_visible_surfaces(
     # -------- 步骤2: 判断可见面 --------
     visible_faces = _determine_visible_faces(sensor_local, exclude_bottom)
     
-    # 统计可见面数量
-    n_visible = 0
+    # -------- 步骤3: 计算各面面积，按比例分配采样数 --------
+    areas = _compute_face_areas(half_l, half_w, half_h)
+    
+    # 计算可见面的总面积
+    total_visible_area = 0.0
     for i in range(6):
         if visible_faces[i]:
-            n_visible += 1
+            total_visible_area += areas[i]
     
-    if n_visible == 0:
-        # 没有可见面（理论上不应该发生）
+    if total_visible_area < 1e-6:
         return np.empty((0, 3), dtype=np.float64), np.empty(0, dtype=np.int64)
     
-    # -------- 步骤3: 在每个可见面采样 --------
-    # 计算每边采样数（总采样数 ≈ n_samples_per_face）
-    n_side = int(np.sqrt(n_samples_per_face))
-    if n_side < 1:
-        n_side = 1
+    # 按面积比例分配采样数
+    samples_per_face = np.zeros(6, dtype=np.int64)
+    for i in range(6):
+        if visible_faces[i]:
+            # 按面积比例分配，至少4个点
+            n = int(total_samples * areas[i] / total_visible_area + 0.5)
+            samples_per_face[i] = max(n, 4)
     
-    total_samples = n_visible * n_side * n_side
-    samples_world = np.empty((total_samples, 3), dtype=np.float64)
-    face_ids = np.empty(total_samples, dtype=np.int64)
+    # -------- 步骤4: 在每个可见面采样 --------
+    # 计算总采样数
+    actual_total = 0
+    for i in range(6):
+        actual_total += samples_per_face[i]
     
-    half_l, half_w, half_h = half_dims[0], half_dims[1], half_dims[2]
+    samples_world = np.empty((actual_total, 3), dtype=np.float64)
+    face_ids = np.empty(actual_total, dtype=np.int64)
     
     write_idx = 0
     for face_id in range(6):
-        if not visible_faces[face_id]:
+        if samples_per_face[face_id] == 0:
             continue
         
-        # 在该面上采样（局部坐标）
-        local_samples = _sample_single_face(face_id, half_l, half_w, half_h, n_side)
+        # 在该面上自适应采样（考虑面的宽高比）
+        local_samples = _sample_single_face_adaptive(
+            face_id, half_l, half_w, half_h, samples_per_face[face_id]
+        )
         
         # 转换到世界坐标: world = R @ local + center
         for i in range(local_samples.shape[0]):
             lx, ly, lz = local_samples[i, 0], local_samples[i, 1], local_samples[i, 2]
             
-            # R @ local (手动矩阵-向量乘法)
             wx = R[0, 0] * lx + R[0, 1] * ly + R[0, 2] * lz + center[0]
             wy = R[1, 0] * lx + R[1, 1] * ly + R[1, 2] * lz + center[1]
             wz = R[2, 0] * lx + R[2, 1] * ly + R[2, 2] * lz + center[2]
@@ -500,7 +548,7 @@ def compute_visibility(
     bbox: Union[np.ndarray, List],
     points: np.ndarray,
     sensor_origin: Optional[np.ndarray] = None,
-    n_samples_per_face: int = 25,
+    total_samples: int = 80,
     angle_thresh_deg: float = 0.5,
     min_blockers: int = 3,
     max_scene_points: int = 15000,
@@ -511,7 +559,7 @@ def compute_visibility(
     
     【算法流程】
     1. 解析bbox参数（支持7/8/9参数格式）
-    2. 在bbox朝向传感器的表面均匀采样
+    2. 在bbox朝向传感器的表面均匀采样（按面积分配）
     3. 对每个采样点，检测射线是否被其他点云遮挡
     4. 可见性 = 未被遮挡的采样点数 / 总采样点数
     
@@ -522,7 +570,7 @@ def compute_visibility(
             - 9参数: [cx, cy, cz, length, width, height, yaw, pitch, roll]
         points: (N, 3) 场景点云
         sensor_origin: (3,) 传感器位置，默认原点
-        n_samples_per_face: 每个可见面的采样数，默认25
+        total_samples: 总采样点数，会按面积比例分配到各可见面，默认80
         angle_thresh_deg: 射线角度阈值（度），默认0.5°
         min_blockers: 最少遮挡点数，默认3
         max_scene_points: 场景点云最大采样数，默认15000
@@ -565,10 +613,10 @@ def compute_visibility(
     center = np.array([cx, cy, cz], dtype=np.float64)
     half_dims = np.array([length/2, width/2, height/2], dtype=np.float64)
     
-    # -------- 表面采样 --------
+    # -------- 表面采样（按面积分配） --------
     samples, face_ids = _sample_visible_surfaces(
         center, half_dims, R, sensor,
-        n_samples_per_face, exclude_bottom
+        total_samples, exclude_bottom
     )
     
     n_samples = samples.shape[0]
