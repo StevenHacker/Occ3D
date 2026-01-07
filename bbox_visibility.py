@@ -1,63 +1,284 @@
 """
-3D Bounding Box Visibility Calculator
-=====================================
+3D Bounding Box Visibility Calculator (Ray-based)
+==================================================
 
-一个完全独立的、即插即用的3D标注框可见性量化工具。
+基于OCC3D射线投射思想的3D标注框可见性量化工具。
 
-依赖：
-    - numpy
-    - numba (用于加速，如不需要可移除@njit装饰器)
+核心原理（来自OCC3D）：
+    - OCCUPIED: 体素反射了LiDAR点（有点云落入）
+    - FREE: 体素被LiDAR射线穿透（射线经过但无点）
+    - UNKNOWN: 既无点云也无射线经过（未观测区域）
 
-输入：
-    - bbox: 3D标注框 [center_x, center_y, center_z, length, width, height, yaw]
-    - points: 点云 (N, 3)
-    - sensor_origin: 传感器位置 (3,)，默认 [0, 0, 0]
+可见性计算：
+    - 观测率 = (OCCUPIED + FREE) / 总体素数
+    - 占用率 = OCCUPIED / (OCCUPIED + FREE)
 
-输出：
-    - visibility_score: 综合可见性分数 [0, 1]
-    - details: 详细指标字典
+依赖：numpy, numba(可选，用于加速)
 
 使用示例：
     >>> from bbox_visibility import compute_visibility
-    >>> bbox = [10, 5, 1, 4.5, 2, 1.5, 0.5]  # [cx, cy, cz, l, w, h, yaw]
-    >>> points = np.random.randn(10000, 3)
-    >>> score, details = compute_visibility(bbox, points)
-    >>> print(f"Visibility: {score:.2f}")
+    >>> bbox = [10, 5, 1, 4.5, 2, 1.5, 0.5]  # [cx,cy,cz,l,w,h,yaw]
+    >>> score, details = compute_visibility(bbox, points, sensor_origin)
 """
 
 import numpy as np
 from typing import Tuple, Dict, List, Optional, Union
 
-# 尝试导入numba，如果没有则使用纯Python
+# Numba加速（可选）
 try:
-    from numba import njit
+    from numba import njit, prange
     HAS_NUMBA = True
 except ImportError:
     HAS_NUMBA = False
-    # 定义一个空装饰器
     def njit(*args, **kwargs):
         def decorator(func):
             return func
         if len(args) == 1 and callable(args[0]):
             return args[0]
         return decorator
+    prange = range
+
+
+# ==================== 体素状态常量 ====================
+VOXEL_UNKNOWN = 0    # 未观测
+VOXEL_FREE = 1       # 射线穿透（空闲）
+VOXEL_OCCUPIED = 2   # 点云占用
+
+
+# ==================== 3D Bresenham射线追踪 ====================
+
+@njit(cache=True)
+def _bresenham_3d(x0: int, y0: int, z0: int, 
+                  x1: int, y1: int, z1: int,
+                  max_steps: int = 10000) -> np.ndarray:
+    """3D Bresenham算法：获取射线经过的所有体素坐标
+    
+    从(x0,y0,z0)到(x1,y1,z1)的直线经过的所有整数格点。
+    
+    Returns:
+        voxels: (N, 3) 经过的体素坐标数组
+    """
+    # 预分配结果数组
+    result = np.empty((max_steps, 3), dtype=np.int32)
+    count = 0
+    
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+    dz = abs(z1 - z0)
+    
+    sx = 1 if x1 > x0 else -1
+    sy = 1 if y1 > y0 else -1
+    sz = 1 if z1 > z0 else -1
+    
+    # 主导轴
+    if dx >= dy and dx >= dz:
+        # X为主导轴
+        err_y = 2 * dy - dx
+        err_z = 2 * dz - dx
+        
+        x, y, z = x0, y0, z0
+        for _ in range(dx + 1):
+            if count < max_steps:
+                result[count, 0] = x
+                result[count, 1] = y
+                result[count, 2] = z
+                count += 1
+            
+            if err_y > 0:
+                y += sy
+                err_y -= 2 * dx
+            if err_z > 0:
+                z += sz
+                err_z -= 2 * dx
+            
+            err_y += 2 * dy
+            err_z += 2 * dz
+            x += sx
+            
+    elif dy >= dx and dy >= dz:
+        # Y为主导轴
+        err_x = 2 * dx - dy
+        err_z = 2 * dz - dy
+        
+        x, y, z = x0, y0, z0
+        for _ in range(dy + 1):
+            if count < max_steps:
+                result[count, 0] = x
+                result[count, 1] = y
+                result[count, 2] = z
+                count += 1
+            
+            if err_x > 0:
+                x += sx
+                err_x -= 2 * dy
+            if err_z > 0:
+                z += sz
+                err_z -= 2 * dy
+            
+            err_x += 2 * dx
+            err_z += 2 * dz
+            y += sy
+            
+    else:
+        # Z为主导轴
+        err_x = 2 * dx - dz
+        err_y = 2 * dy - dz
+        
+        x, y, z = x0, y0, z0
+        for _ in range(dz + 1):
+            if count < max_steps:
+                result[count, 0] = x
+                result[count, 1] = y
+                result[count, 2] = z
+                count += 1
+            
+            if err_x > 0:
+                x += sx
+                err_x -= 2 * dz
+            if err_y > 0:
+                y += sy
+                err_y -= 2 * dz
+            
+            err_x += 2 * dx
+            err_y += 2 * dy
+            z += sz
+    
+    return result[:count]
 
 
 # ==================== 核心计算函数 ====================
 
 @njit(cache=True)
-def _rotate_points_z(points: np.ndarray, angle: float) -> np.ndarray:
-    """绕Z轴旋转点云"""
-    cos_a = np.cos(angle)
-    sin_a = np.sin(angle)
-    n = points.shape[0]
-    rotated = np.empty((n, 3), dtype=np.float64)
-    for i in range(n):
-        x, y, z = points[i, 0], points[i, 1], points[i, 2]
-        rotated[i, 0] = cos_a * x - sin_a * y
-        rotated[i, 1] = sin_a * x + cos_a * y
-        rotated[i, 2] = z
-    return rotated
+def _rotate_point(x: float, y: float, cos_a: float, sin_a: float) -> Tuple[float, float]:
+    """2D旋转"""
+    return cos_a * x - sin_a * y, sin_a * x + cos_a * y
+
+
+@njit(cache=True)
+def _world_to_voxel(px: float, py: float, pz: float,
+                    bbox_center: np.ndarray,
+                    bbox_size: np.ndarray,
+                    cos_yaw: float, sin_yaw: float,
+                    voxel_size: float,
+                    nx: int, ny: int, nz: int) -> Tuple[int, int, int, bool]:
+    """世界坐标转体素索引
+    
+    Returns:
+        vx, vy, vz: 体素索引
+        valid: 是否在bbox范围内
+    """
+    # 平移到bbox中心
+    dx = px - bbox_center[0]
+    dy = py - bbox_center[1]
+    dz = pz - bbox_center[2]
+    
+    # 逆旋转到局部坐标系
+    local_x, local_y = _rotate_point(dx, dy, cos_yaw, -sin_yaw)
+    local_z = dz
+    
+    # 偏移到[0, size]范围
+    local_x += bbox_size[0] / 2
+    local_y += bbox_size[1] / 2
+    local_z += bbox_size[2] / 2
+    
+    # 转换为体素索引
+    vx = int(local_x / voxel_size)
+    vy = int(local_y / voxel_size)
+    vz = int(local_z / voxel_size)
+    
+    # 边界检查
+    valid = (0 <= vx < nx) and (0 <= vy < ny) and (0 <= vz < nz)
+    
+    return vx, vy, vz, valid
+
+
+@njit(cache=True)
+def _compute_ray_voxel_states(
+    points: np.ndarray,
+    sensor_origin: np.ndarray,
+    bbox_center: np.ndarray,
+    bbox_size: np.ndarray,
+    yaw: float,
+    voxel_size: float
+) -> Tuple[np.ndarray, int, int, int]:
+    """基于射线投射计算体素状态
+    
+    对每个点云点：
+    1. 从传感器发射射线到该点
+    2. 射线经过的体素标记为FREE
+    3. 终点体素标记为OCCUPIED
+    
+    Returns:
+        voxel_grid: (nx, ny, nz) 体素状态网格
+        n_occupied: OCCUPIED体素数
+        n_free: FREE体素数
+        n_total: 总体素数
+    """
+    # 计算体素网格尺寸
+    nx = max(1, int(np.ceil(bbox_size[0] / voxel_size)))
+    ny = max(1, int(np.ceil(bbox_size[1] / voxel_size)))
+    nz = max(1, int(np.ceil(bbox_size[2] / voxel_size)))
+    n_total = nx * ny * nz
+    
+    # 创建体素网格（一维数组模拟3D）
+    voxel_grid = np.zeros(n_total, dtype=np.uint8)
+    
+    cos_yaw = np.cos(-yaw)
+    sin_yaw = np.sin(-yaw)
+    
+    # 传感器在体素坐标系中的位置
+    sensor_vx, sensor_vy, sensor_vz, _ = _world_to_voxel(
+        sensor_origin[0], sensor_origin[1], sensor_origin[2],
+        bbox_center, bbox_size, cos_yaw, sin_yaw, voxel_size, nx, ny, nz
+    )
+    
+    n_points = points.shape[0]
+    
+    for i in range(n_points):
+        px, py, pz = points[i, 0], points[i, 1], points[i, 2]
+        
+        # 点的体素坐标
+        point_vx, point_vy, point_vz, point_valid = _world_to_voxel(
+            px, py, pz, bbox_center, bbox_size, 
+            cos_yaw, sin_yaw, voxel_size, nx, ny, nz
+        )
+        
+        # 射线追踪：从传感器到点
+        ray_voxels = _bresenham_3d(
+            sensor_vx, sensor_vy, sensor_vz,
+            point_vx, point_vy, point_vz
+        )
+        
+        # 标记射线经过的体素
+        n_ray = ray_voxels.shape[0]
+        for j in range(n_ray):
+            rvx = ray_voxels[j, 0]
+            rvy = ray_voxels[j, 1]
+            rvz = ray_voxels[j, 2]
+            
+            # 检查是否在bbox范围内
+            if 0 <= rvx < nx and 0 <= rvy < ny and 0 <= rvz < nz:
+                idx = rvx * ny * nz + rvy * nz + rvz
+                
+                # 最后一个体素是终点（OCCUPIED），其他是FREE
+                if j == n_ray - 1 and point_valid:
+                    # OCCUPIED优先级高于FREE
+                    voxel_grid[idx] = VOXEL_OCCUPIED
+                else:
+                    # 只有当前状态为UNKNOWN时才标记为FREE
+                    if voxel_grid[idx] == VOXEL_UNKNOWN:
+                        voxel_grid[idx] = VOXEL_FREE
+    
+    # 统计
+    n_occupied = 0
+    n_free = 0
+    for i in range(n_total):
+        if voxel_grid[i] == VOXEL_OCCUPIED:
+            n_occupied += 1
+        elif voxel_grid[i] == VOXEL_FREE:
+            n_free += 1
+    
+    return voxel_grid, n_occupied, n_free, n_total
 
 
 @njit(cache=True)
@@ -65,17 +286,7 @@ def _points_in_box(points: np.ndarray,
                    center: np.ndarray, 
                    size: np.ndarray, 
                    yaw: float) -> np.ndarray:
-    """判断点是否在旋转包围盒内
-    
-    Args:
-        points: (N, 3) 点云
-        center: (3,) 中心点 [x, y, z]
-        size: (3,) 尺寸 [length, width, height]
-        yaw: 绕Z轴旋转角（弧度）
-    
-    Returns:
-        mask: (N,) 布尔数组
-    """
+    """判断点是否在旋转包围盒内"""
     n = points.shape[0]
     mask = np.zeros(n, dtype=np.bool_)
     
@@ -86,16 +297,13 @@ def _points_in_box(points: np.ndarray,
     half_h = size[2] / 2
     
     for i in range(n):
-        # 平移到中心
         dx = points[i, 0] - center[0]
         dy = points[i, 1] - center[1]
         dz = points[i, 2] - center[2]
         
-        # 逆旋转
         local_x = cos_yaw * dx - sin_yaw * dy
         local_y = sin_yaw * dx + cos_yaw * dy
         
-        # 判断是否在框内
         if (abs(local_x) <= half_l and 
             abs(local_y) <= half_w and 
             abs(dz) <= half_h):
@@ -105,196 +313,86 @@ def _points_in_box(points: np.ndarray,
 
 
 @njit(cache=True)
-def _compute_voxel_occupancy(points_local: np.ndarray,
-                              size: np.ndarray,
-                              voxel_size: float) -> float:
-    """计算体素占用率
-    
-    将bbox划分为体素网格，计算被点云占用的体素比例。
-    """
-    n_points = points_local.shape[0]
-    if n_points == 0:
-        return 0.0
-    
-    # 计算网格尺寸
-    nx = max(1, int(np.ceil(size[0] / voxel_size)))
-    ny = max(1, int(np.ceil(size[1] / voxel_size)))
-    nz = max(1, int(np.ceil(size[2] / voxel_size)))
-    total_voxels = nx * ny * nz
-    
-    # 使用一维数组模拟3D网格（numba兼容）
-    voxel_occupied = np.zeros(total_voxels, dtype=np.bool_)
-    
-    half_l = size[0] / 2
-    half_w = size[1] / 2
-    half_h = size[2] / 2
-    
-    for i in range(n_points):
-        # 映射到 [0, size] 范围
-        x = points_local[i, 0] + half_l
-        y = points_local[i, 1] + half_w
-        z = points_local[i, 2] + half_h
-        
-        # 计算体素索引
-        vx = min(nx - 1, max(0, int(x / voxel_size)))
-        vy = min(ny - 1, max(0, int(y / voxel_size)))
-        vz = min(nz - 1, max(0, int(z / voxel_size)))
-        
-        idx = vx * ny * nz + vy * nz + vz
-        voxel_occupied[idx] = True
-    
-    # 统计占用数量
-    occupied_count = 0
-    for i in range(total_voxels):
-        if voxel_occupied[i]:
-            occupied_count += 1
-    
-    return occupied_count / total_voxels
-
-
-@njit(cache=True)
-def _compute_surface_points(points_local: np.ndarray,
-                             size: np.ndarray,
-                             threshold_ratio: float = 0.15) -> np.ndarray:
-    """统计各表面附近的点数
+def _compute_surface_observation(
+    voxel_grid: np.ndarray,
+    nx: int, ny: int, nz: int,
+    surface_depth: int = 2
+) -> np.ndarray:
+    """计算各表面的观测情况
     
     Returns:
-        counts: (6,) [+x, -x, +y, -y, +z, -z] 各面点数
+        surface_obs: (6, 3) 每个面的[observed, occupied, total]
+        顺序: [+x, -x, +y, -y, +z, -z]
     """
-    counts = np.zeros(6, dtype=np.int64)
-    n = points_local.shape[0]
+    surface_obs = np.zeros((6, 3), dtype=np.int64)
     
-    if n == 0:
-        return counts
+    # +x面 (front)
+    for y in range(ny):
+        for z in range(nz):
+            for x in range(max(0, nx - surface_depth), nx):
+                idx = x * ny * nz + y * nz + z
+                surface_obs[0, 2] += 1  # total
+                if voxel_grid[idx] != VOXEL_UNKNOWN:
+                    surface_obs[0, 0] += 1  # observed
+                if voxel_grid[idx] == VOXEL_OCCUPIED:
+                    surface_obs[0, 1] += 1  # occupied
     
-    half_l = size[0] / 2
-    half_w = size[1] / 2
-    half_h = size[2] / 2
+    # -x面 (back)
+    for y in range(ny):
+        for z in range(nz):
+            for x in range(min(nx, surface_depth)):
+                idx = x * ny * nz + y * nz + z
+                surface_obs[1, 2] += 1
+                if voxel_grid[idx] != VOXEL_UNKNOWN:
+                    surface_obs[1, 0] += 1
+                if voxel_grid[idx] == VOXEL_OCCUPIED:
+                    surface_obs[1, 1] += 1
     
-    thresh_l = size[0] * threshold_ratio
-    thresh_w = size[1] * threshold_ratio
-    thresh_h = size[2] * threshold_ratio
+    # +y面 (left)
+    for x in range(nx):
+        for z in range(nz):
+            for y in range(max(0, ny - surface_depth), ny):
+                idx = x * ny * nz + y * nz + z
+                surface_obs[2, 2] += 1
+                if voxel_grid[idx] != VOXEL_UNKNOWN:
+                    surface_obs[2, 0] += 1
+                if voxel_grid[idx] == VOXEL_OCCUPIED:
+                    surface_obs[2, 1] += 1
     
-    for i in range(n):
-        x, y, z = points_local[i, 0], points_local[i, 1], points_local[i, 2]
-        
-        if x > half_l - thresh_l:      # +x (front)
-            counts[0] += 1
-        if x < -half_l + thresh_l:     # -x (back)
-            counts[1] += 1
-        if y > half_w - thresh_w:      # +y (left)
-            counts[2] += 1
-        if y < -half_w + thresh_w:     # -y (right)
-            counts[3] += 1
-        if z > half_h - thresh_h:      # +z (top)
-            counts[4] += 1
-        if z < -half_h + thresh_h:     # -z (bottom)
-            counts[5] += 1
+    # -y面 (right)
+    for x in range(nx):
+        for z in range(nz):
+            for y in range(min(ny, surface_depth)):
+                idx = x * ny * nz + y * nz + z
+                surface_obs[3, 2] += 1
+                if voxel_grid[idx] != VOXEL_UNKNOWN:
+                    surface_obs[3, 0] += 1
+                if voxel_grid[idx] == VOXEL_OCCUPIED:
+                    surface_obs[3, 1] += 1
     
-    return counts
-
-
-@njit(cache=True)
-def _compute_surface_visibility(surface_counts: np.ndarray,
-                                 size: np.ndarray,
-                                 sensor_local: np.ndarray,
-                                 total_points: int) -> Tuple[np.ndarray, float]:
-    """计算各表面可见性
+    # +z面 (top)
+    for x in range(nx):
+        for y in range(ny):
+            for z in range(max(0, nz - surface_depth), nz):
+                idx = x * ny * nz + y * nz + z
+                surface_obs[4, 2] += 1
+                if voxel_grid[idx] != VOXEL_UNKNOWN:
+                    surface_obs[4, 0] += 1
+                if voxel_grid[idx] == VOXEL_OCCUPIED:
+                    surface_obs[4, 1] += 1
     
-    Returns:
-        surface_vis: (6,) 各表面可见性分数
-        mean_vis: 平均可见性
-    """
-    surface_vis = np.zeros(6, dtype=np.float64)
+    # -z面 (bottom)
+    for x in range(nx):
+        for y in range(ny):
+            for z in range(min(nz, surface_depth)):
+                idx = x * ny * nz + y * nz + z
+                surface_obs[5, 2] += 1
+                if voxel_grid[idx] != VOXEL_UNKNOWN:
+                    surface_obs[5, 0] += 1
+                if voxel_grid[idx] == VOXEL_OCCUPIED:
+                    surface_obs[5, 1] += 1
     
-    if total_points == 0:
-        return surface_vis, 0.0
-    
-    # 表面面积
-    areas = np.array([
-        size[1] * size[2],  # +x/-x
-        size[1] * size[2],
-        size[0] * size[2],  # +y/-y
-        size[0] * size[2],
-        size[0] * size[1],  # +z/-z
-        size[0] * size[1],
-    ], dtype=np.float64)
-    
-    total_area = np.sum(areas)
-    
-    # 判断哪些面理论上可见（基于传感器位置）
-    visible_mask = np.array([
-        sensor_local[0] > 0,   # +x可见当传感器在+x侧
-        sensor_local[0] < 0,   # -x
-        sensor_local[1] > 0,   # +y
-        sensor_local[1] < 0,   # -y
-        sensor_local[2] > 0,   # +z
-        sensor_local[2] < 0,   # -z
-    ])
-    
-    visible_count = 0
-    visible_sum = 0.0
-    
-    for i in range(6):
-        if visible_mask[i]:
-            # 期望点数（按面积比例）
-            expected = max(1.0, total_points * areas[i] / total_area * 0.4)
-            surface_vis[i] = min(1.0, surface_counts[i] / expected)
-            visible_count += 1
-            visible_sum += surface_vis[i]
-        else:
-            # 不可见面有点说明可能有反射或特殊情况
-            if surface_counts[i] > 0:
-                surface_vis[i] = 0.2
-    
-    mean_vis = visible_sum / max(1, visible_count)
-    return surface_vis, mean_vis
-
-
-@njit(cache=True)
-def _compute_depth_distribution(points_local: np.ndarray,
-                                 sensor_local: np.ndarray,
-                                 n_bins: int = 8) -> float:
-    """计算深度分布连续性
-    
-    评估点云在深度方向的覆盖连续性。
-    """
-    n = points_local.shape[0]
-    if n < 3:
-        return 0.0
-    
-    # 计算各点到传感器的距离
-    depths = np.empty(n, dtype=np.float64)
-    for i in range(n):
-        dx = points_local[i, 0] - sensor_local[0]
-        dy = points_local[i, 1] - sensor_local[1]
-        dz = points_local[i, 2] - sensor_local[2]
-        depths[i] = np.sqrt(dx*dx + dy*dy + dz*dz)
-    
-    min_d = depths[0]
-    max_d = depths[0]
-    for i in range(1, n):
-        if depths[i] < min_d:
-            min_d = depths[i]
-        if depths[i] > max_d:
-            max_d = depths[i]
-    
-    if max_d - min_d < 0.1:
-        return 1.0
-    
-    bin_size = (max_d - min_d) / n_bins
-    bin_counts = np.zeros(n_bins, dtype=np.int64)
-    
-    for i in range(n):
-        idx = min(n_bins - 1, int((depths[i] - min_d) / bin_size))
-        bin_counts[idx] += 1
-    
-    non_empty = 0
-    for i in range(n_bins):
-        if bin_counts[i] > 0:
-            non_empty += 1
-    
-    return non_empty / n_bins
+    return surface_obs
 
 
 # ==================== 主函数 ====================
@@ -303,49 +401,44 @@ def compute_visibility(
     bbox: Union[np.ndarray, List],
     points: np.ndarray,
     sensor_origin: Optional[np.ndarray] = None,
-    voxel_size: float = 0.1,
+    voxel_size: float = 0.2,
     weights: Optional[Dict[str, float]] = None
 ) -> Tuple[float, Dict]:
-    """计算3D标注框的可见性
+    """计算3D标注框的可见性（基于OCC3D射线投射思想）
+    
+    核心原理：
+        1. 对每个点云点，从传感器发射射线
+        2. 射线经过的体素标记为FREE（空闲）
+        3. 射线终点体素标记为OCCUPIED（占用）
+        4. 未被任何射线触及的体素为UNKNOWN（未知）
     
     Args:
         bbox: (7,) 标注框 [cx, cy, cz, length, width, height, yaw]
-              - cx, cy, cz: 中心点坐标
-              - length, width, height: 长宽高
-              - yaw: 绕Z轴旋转角度（弧度）
-        points: (N, 3) 或 (N, 3+) 点云数据
-        sensor_origin: (3,) 传感器位置，默认 [0, 0, 0]
-        voxel_size: 体素大小，用于体素占用率计算
-        weights: 各指标权重字典，默认均匀权重
+        points: (N, 3) 点云
+        sensor_origin: (3,) 传感器位置，默认[0,0,0]
+        voxel_size: 体素大小（米），默认0.2m
+        weights: 指标权重，默认均匀
     
     Returns:
         score: 综合可见性分数 [0, 1]
-        details: 详细指标字典，包含:
-            - visibility_score: 综合分数
-            - point_count: 框内点数
-            - point_density: 点密度 (点/m³)
-            - point_density_score: 密度分数
-            - voxel_occupancy: 体素占用率
-            - surface_visibility: 表面可见性均值
-            - surface_details: 各表面可见性 {front, back, left, right, top, bottom}
-            - depth_continuity: 深度连续性
-    
-    Example:
-        >>> bbox = np.array([10, 5, 1, 4.5, 2, 1.5, 0.5])
-        >>> points = np.random.randn(10000, 3) * 20
-        >>> score, details = compute_visibility(bbox, points)
-        >>> print(f"Score: {score:.2f}, Points: {details['point_count']}")
+        details: 详细指标字典
+            - observation_ratio: 观测率 = (OCCUPIED+FREE) / TOTAL
+            - occupancy_ratio: 占用率 = OCCUPIED / (OCCUPIED+FREE)
+            - n_occupied: OCCUPIED体素数
+            - n_free: FREE体素数  
+            - n_unknown: UNKNOWN体素数
+            - n_total: 总体素数
+            - surface_observation: 各表面观测情况
     """
-    # 默认值处理
+    # 默认值
     if sensor_origin is None:
         sensor_origin = np.array([0.0, 0.0, 0.0], dtype=np.float64)
     
     if weights is None:
         weights = {
-            'point_density': 0.25,
-            'voxel_occupancy': 0.25,
-            'surface_visibility': 0.25,
-            'depth_continuity': 0.25,
+            'observation_ratio': 0.4,   # 观测覆盖率
+            'occupancy_ratio': 0.3,     # 占用密度
+            'surface_visibility': 0.3,  # 表面可见性
         }
     
     # 类型转换
@@ -353,80 +446,90 @@ def compute_visibility(
     points = np.asarray(points[:, :3], dtype=np.float64).copy()
     sensor_origin = np.asarray(sensor_origin, dtype=np.float64)
     
-    # 解析bbox
     center = bbox[:3]
     size = bbox[3:6]
     yaw = bbox[6]
     
-    # 1. 筛选框内点云
-    in_box = _points_in_box(points, center, size, yaw)
-    points_in_box = points[in_box]
-    n_points = points_in_box.shape[0]
+    # 计算体素网格尺寸
+    nx = max(1, int(np.ceil(size[0] / voxel_size)))
+    ny = max(1, int(np.ceil(size[1] / voxel_size)))
+    nz = max(1, int(np.ceil(size[2] / voxel_size)))
     
-    # 2. 转换到局部坐标系
-    if n_points > 0:
-        points_centered = points_in_box - center
-        points_local = _rotate_points_z(points_centered, -yaw)
-        sensor_centered = sensor_origin - center
-        sensor_local = _rotate_points_z(sensor_centered.reshape(1, 3), -yaw)[0]
-    else:
-        points_local = np.empty((0, 3), dtype=np.float64)
-        sensor_local = np.zeros(3, dtype=np.float64)
+    # 射线投射计算体素状态
+    voxel_grid, n_occupied, n_free, n_total = _compute_ray_voxel_states(
+        points, sensor_origin, center, size, yaw, voxel_size
+    )
     
-    # 3. 计算各项指标
+    n_unknown = n_total - n_occupied - n_free
+    n_observed = n_occupied + n_free
+    
+    # 计算各项指标
     details = {}
     
-    # 3.1 点密度
-    volume = size[0] * size[1] * size[2]
-    point_density = n_points / max(volume, 1e-6)
-    # 归一化（经验值：理想密度约50-100点/m³）
-    density_score = min(1.0, point_density / 80.0)
+    # 1. 观测率：被观测到的体素占比
+    observation_ratio = n_observed / max(1, n_total)
+    details['observation_ratio'] = float(observation_ratio)
     
-    details['point_count'] = int(n_points)
-    details['point_density'] = float(point_density)
-    details['point_density_score'] = float(density_score)
-    
-    # 3.2 体素占用率
-    if n_points >= 5:
-        voxel_occ = _compute_voxel_occupancy(points_local, size, voxel_size)
+    # 2. 占用率：在被观测的体素中，占用的比例
+    if n_observed > 0:
+        occupancy_ratio = n_occupied / n_observed
     else:
-        voxel_occ = 0.0
-    details['voxel_occupancy'] = float(voxel_occ)
+        occupancy_ratio = 0.0
+    details['occupancy_ratio'] = float(occupancy_ratio)
     
-    # 3.3 表面可见性
-    if n_points >= 5:
-        surface_counts = _compute_surface_points(points_local, size)
-        surface_vis, surface_mean = _compute_surface_visibility(
-            surface_counts, size, sensor_local, n_points
-        )
-    else:
-        surface_vis = np.zeros(6)
-        surface_mean = 0.0
+    # 3. 表面观测情况
+    surface_obs = _compute_surface_observation(voxel_grid, nx, ny, nz)
+    surface_names = ['front', 'back', 'left', 'right', 'top', 'bottom']
+    surface_details = {}
+    surface_vis_sum = 0.0
+    surface_count = 0
     
-    details['surface_visibility'] = float(surface_mean)
-    details['surface_details'] = {
-        'front': float(surface_vis[0]),   # +x
-        'back': float(surface_vis[1]),    # -x
-        'left': float(surface_vis[2]),    # +y
-        'right': float(surface_vis[3]),   # -y
-        'top': float(surface_vis[4]),     # +z
-        'bottom': float(surface_vis[5]),  # -z
-    }
+    for i, name in enumerate(surface_names):
+        observed = surface_obs[i, 0]
+        occupied = surface_obs[i, 1]
+        total = surface_obs[i, 2]
+        
+        if total > 0:
+            obs_ratio = observed / total
+            occ_ratio = occupied / max(1, observed)
+        else:
+            obs_ratio = 0.0
+            occ_ratio = 0.0
+        
+        surface_details[name] = {
+            'observation_ratio': float(obs_ratio),
+            'occupancy_ratio': float(occ_ratio),
+            'observed': int(observed),
+            'occupied': int(occupied),
+            'total': int(total),
+        }
+        
+        # 表面可见性：观测率 * 占用率的调和
+        if obs_ratio > 0:
+            surface_vis_sum += obs_ratio
+            surface_count += 1
     
-    # 3.4 深度连续性
-    if n_points >= 5:
-        depth_cont = _compute_depth_distribution(points_local, sensor_local)
-    else:
-        depth_cont = 0.0
-    details['depth_continuity'] = float(depth_cont)
+    surface_visibility = surface_vis_sum / max(1, surface_count)
+    details['surface_visibility'] = float(surface_visibility)
+    details['surface_details'] = surface_details
     
-    # 4. 综合分数
+    # 体素统计
+    details['n_occupied'] = int(n_occupied)
+    details['n_free'] = int(n_free)
+    details['n_unknown'] = int(n_unknown)
+    details['n_total'] = int(n_total)
+    details['voxel_grid_shape'] = (nx, ny, nz)
+    
+    # 框内点数
+    in_box = _points_in_box(points, center, size, yaw)
+    details['points_in_box'] = int(np.sum(in_box))
+    
+    # 综合分数
     total_weight = sum(weights.values())
     score = (
-        weights.get('point_density', 0.25) / total_weight * density_score +
-        weights.get('voxel_occupancy', 0.25) / total_weight * voxel_occ +
-        weights.get('surface_visibility', 0.25) / total_weight * surface_mean +
-        weights.get('depth_continuity', 0.25) / total_weight * depth_cont
+        weights.get('observation_ratio', 0.4) / total_weight * observation_ratio +
+        weights.get('occupancy_ratio', 0.3) / total_weight * min(1.0, occupancy_ratio * 5) +
+        weights.get('surface_visibility', 0.3) / total_weight * surface_visibility
     )
     
     details['visibility_score'] = float(score)
@@ -438,22 +541,10 @@ def compute_visibility_batch(
     bboxes: np.ndarray,
     points: np.ndarray,
     sensor_origin: Optional[np.ndarray] = None,
-    voxel_size: float = 0.1,
+    voxel_size: float = 0.2,
     weights: Optional[Dict[str, float]] = None
 ) -> Tuple[np.ndarray, List[Dict]]:
-    """批量计算多个标注框的可见性
-    
-    Args:
-        bboxes: (M, 7) 多个标注框
-        points: (N, 3) 点云
-        sensor_origin: (3,) 传感器位置
-        voxel_size: 体素大小
-        weights: 指标权重
-    
-    Returns:
-        scores: (M,) 可见性分数数组
-        details_list: 详细指标列表
-    """
+    """批量计算多个框的可见性"""
     bboxes = np.asarray(bboxes, dtype=np.float64)
     n_boxes = bboxes.shape[0]
     
@@ -461,9 +552,7 @@ def compute_visibility_batch(
     details_list = []
     
     for i in range(n_boxes):
-        s, d = compute_visibility(
-            bboxes[i], points, sensor_origin, voxel_size, weights
-        )
+        s, d = compute_visibility(bboxes[i], points, sensor_origin, voxel_size, weights)
         scores[i] = s
         details_list.append(d)
     
@@ -471,15 +560,7 @@ def compute_visibility_batch(
 
 
 def classify_visibility(score: float) -> str:
-    """将分数转换为可见性等级
-    
-    Args:
-        score: 可见性分数 [0, 1]
-    
-    Returns:
-        等级: FULLY_VISIBLE / MOSTLY_VISIBLE / PARTIALLY_VISIBLE / 
-              MOSTLY_OCCLUDED / FULLY_OCCLUDED
-    """
+    """可见性等级分类"""
     if score >= 0.7:
         return "FULLY_VISIBLE"
     elif score >= 0.4:
@@ -493,154 +574,202 @@ def classify_visibility(score: float) -> str:
 
 
 def warmup():
-    """预热JIT编译（如果使用numba）
-    
-    在程序启动时调用一次，可避免首次计算的延迟。
-    """
+    """预热JIT编译"""
     if not HAS_NUMBA:
         return
+    dummy_pts = np.random.randn(100, 3).astype(np.float64) * 10
+    dummy_bbox = np.array([5, 5, 1, 4, 2, 1.5, 0], dtype=np.float64)
+    dummy_sensor = np.array([0, 0, 1.5], dtype=np.float64)
+    compute_visibility(dummy_bbox, dummy_pts, dummy_sensor, voxel_size=0.5)
+
+
+# ==================== 可视化辅助 ====================
+
+def get_voxel_grid(
+    bbox: np.ndarray,
+    points: np.ndarray,
+    sensor_origin: np.ndarray,
+    voxel_size: float = 0.2
+) -> Tuple[np.ndarray, Dict]:
+    """获取体素网格用于可视化
     
-    # 小规模数据触发编译
-    dummy_pts = np.random.randn(50, 3).astype(np.float64)
-    dummy_bbox = np.array([0, 0, 0, 2, 2, 2, 0], dtype=np.float64)
-    compute_visibility(dummy_bbox, dummy_pts)
+    Returns:
+        voxel_states: (nx, ny, nz) 体素状态
+            0=UNKNOWN, 1=FREE, 2=OCCUPIED
+        info: 包含网格尺寸、bbox信息等
+    """
+    bbox = np.asarray(bbox, dtype=np.float64)
+    points = np.asarray(points[:, :3], dtype=np.float64)
+    sensor_origin = np.asarray(sensor_origin, dtype=np.float64)
+    
+    center = bbox[:3]
+    size = bbox[3:6]
+    yaw = bbox[6]
+    
+    nx = max(1, int(np.ceil(size[0] / voxel_size)))
+    ny = max(1, int(np.ceil(size[1] / voxel_size)))
+    nz = max(1, int(np.ceil(size[2] / voxel_size)))
+    
+    voxel_flat, n_occ, n_free, n_total = _compute_ray_voxel_states(
+        points, sensor_origin, center, size, yaw, voxel_size
+    )
+    
+    voxel_grid = voxel_flat.reshape((nx, ny, nz))
+    
+    info = {
+        'shape': (nx, ny, nz),
+        'voxel_size': voxel_size,
+        'bbox_center': center,
+        'bbox_size': size,
+        'bbox_yaw': yaw,
+        'n_occupied': n_occ,
+        'n_free': n_free,
+        'n_unknown': n_total - n_occ - n_free,
+    }
+    
+    return voxel_grid, info
 
 
-# ==================== 测试代码 ====================
+# ==================== 测试 ====================
 
 if __name__ == '__main__':
     import time
     
-    print("=" * 60)
-    print("3D Bounding Box Visibility Calculator")
-    print("=" * 60)
-    print(f"Numba available: {HAS_NUMBA}")
+    print("=" * 65)
+    print("3D BBox Visibility Calculator (Ray-based, OCC3D Style)")
+    print("=" * 65)
+    print(f"Numba: {HAS_NUMBA}")
     
     np.random.seed(42)
     
-    # 创建测试场景
-    # 背景点云
-    bg_points = np.random.randn(5000, 3) * 30
-    bg_points[:, 2] = np.abs(bg_points[:, 2]) * 0.3 - 1
-    
-    # 可见目标：在表面生成密集点云
-    car_center = np.array([12, 4, 0.8])
-    car_size = np.array([4.5, 2.0, 1.5])
-    car_yaw = 0.15
-    
-    # 生成表面点
-    n_surface = 400
-    surface_pts = []
-    for _ in range(n_surface):
-        face = np.random.randint(6)
-        if face == 0:
-            p = [car_size[0]/2, np.random.uniform(-1, 1) * car_size[1]/2,
-                 np.random.uniform(-1, 1) * car_size[2]/2]
-        elif face == 1:
-            p = [-car_size[0]/2, np.random.uniform(-1, 1) * car_size[1]/2,
-                 np.random.uniform(-1, 1) * car_size[2]/2]
-        elif face == 2:
-            p = [np.random.uniform(-1, 1) * car_size[0]/2, car_size[1]/2,
-                 np.random.uniform(-1, 1) * car_size[2]/2]
-        elif face == 3:
-            p = [np.random.uniform(-1, 1) * car_size[0]/2, -car_size[1]/2,
-                 np.random.uniform(-1, 1) * car_size[2]/2]
-        elif face == 4:
-            p = [np.random.uniform(-1, 1) * car_size[0]/2,
-                 np.random.uniform(-1, 1) * car_size[1]/2, car_size[2]/2]
-        else:
-            p = [np.random.uniform(-1, 1) * car_size[0]/2,
-                 np.random.uniform(-1, 1) * car_size[1]/2, -car_size[2]/2]
-        surface_pts.append(p)
-    
-    surface_pts = np.array(surface_pts)
-    # 旋转
-    c, s = np.cos(car_yaw), np.sin(car_yaw)
-    rot_pts = np.zeros_like(surface_pts)
-    rot_pts[:, 0] = c * surface_pts[:, 0] - s * surface_pts[:, 1]
-    rot_pts[:, 1] = s * surface_pts[:, 0] + c * surface_pts[:, 1]
-    rot_pts[:, 2] = surface_pts[:, 2]
-    car_points = rot_pts + car_center
-    
-    # 遮挡目标：只有少量点
-    occ_center = np.array([40, -8, 0.8])
-    occ_size = np.array([4.5, 2.0, 1.5])
-    occ_yaw = -0.3
-    occ_points = np.random.randn(25, 3) * 0.2 + occ_center
-    
-    # 合并
-    all_points = np.vstack([bg_points, car_points, occ_points])
-    
-    # 传感器位置
+    # 场景设置
     sensor = np.array([0, 0, 1.8])
     
-    # 预热
-    print("\nWarming up...")
-    warmup()
+    # 背景点云
+    bg = np.random.randn(3000, 3) * 25
+    bg[:, 2] = np.abs(bg[:, 2]) * 0.3 - 0.5
     
-    # 测试可见目标
-    print("\n--- Test 1: Visible Object ---")
-    bbox1 = np.array([*car_center, *car_size, car_yaw])
+    # 目标1：可见车辆（表面有密集点云）
+    car1_center = np.array([10, 3, 0.8])
+    car1_size = np.array([4.5, 2.0, 1.5])
+    car1_yaw = 0.1
+    
+    # 在车辆表面生成点
+    car1_pts = []
+    for _ in range(300):
+        face = np.random.randint(6)
+        if face == 0:
+            p = [car1_size[0]/2, np.random.uniform(-1,1)*car1_size[1]/2,
+                 np.random.uniform(-1,1)*car1_size[2]/2]
+        elif face == 1:
+            p = [-car1_size[0]/2, np.random.uniform(-1,1)*car1_size[1]/2,
+                 np.random.uniform(-1,1)*car1_size[2]/2]
+        elif face == 2:
+            p = [np.random.uniform(-1,1)*car1_size[0]/2, car1_size[1]/2,
+                 np.random.uniform(-1,1)*car1_size[2]/2]
+        elif face == 3:
+            p = [np.random.uniform(-1,1)*car1_size[0]/2, -car1_size[1]/2,
+                 np.random.uniform(-1,1)*car1_size[2]/2]
+        elif face == 4:
+            p = [np.random.uniform(-1,1)*car1_size[0]/2,
+                 np.random.uniform(-1,1)*car1_size[1]/2, car1_size[2]/2]
+        else:
+            p = [np.random.uniform(-1,1)*car1_size[0]/2,
+                 np.random.uniform(-1,1)*car1_size[1]/2, -car1_size[2]/2]
+        car1_pts.append(p)
+    car1_pts = np.array(car1_pts)
+    c, s = np.cos(car1_yaw), np.sin(car1_yaw)
+    car1_pts_rot = np.zeros_like(car1_pts)
+    car1_pts_rot[:, 0] = c * car1_pts[:, 0] - s * car1_pts[:, 1]
+    car1_pts_rot[:, 1] = s * car1_pts[:, 0] + c * car1_pts[:, 1]
+    car1_pts_rot[:, 2] = car1_pts[:, 2]
+    car1_pts_world = car1_pts_rot + car1_center
+    
+    # 目标2：遮挡车辆（很少点）
+    car2_center = np.array([35, -8, 0.8])
+    car2_size = np.array([4.5, 2.0, 1.5])
+    car2_yaw = -0.2
+    car2_pts = np.random.randn(20, 3) * 0.15 + car2_center
+    
+    # 合并
+    all_points = np.vstack([bg, car1_pts_world, car2_pts])
+    
+    # 预热
+    print("\nWarming up JIT...")
+    warmup()
+    print("Done.")
+    
+    # 测试1：可见目标
+    print("\n" + "-" * 50)
+    print("Test 1: Visible Object")
+    print("-" * 50)
+    bbox1 = np.array([*car1_center, *car1_size, car1_yaw])
     t0 = time.time()
-    score1, details1 = compute_visibility(bbox1, all_points, sensor)
+    score1, details1 = compute_visibility(bbox1, all_points, sensor, voxel_size=0.2)
     t1 = time.time()
     
     print(f"Score: {score1:.3f} ({classify_visibility(score1)})")
-    print(f"Points in box: {details1['point_count']}")
-    print(f"Point density: {details1['point_density']:.1f} pts/m³")
-    print(f"Voxel occupancy: {details1['voxel_occupancy']:.3f}")
-    print(f"Surface visibility: {details1['surface_visibility']:.3f}")
-    print(f"Depth continuity: {details1['depth_continuity']:.3f}")
+    print(f"Observation Ratio: {details1['observation_ratio']:.3f}")
+    print(f"  (OBSERVED={details1['n_occupied']+details1['n_free']}, "
+          f"UNKNOWN={details1['n_unknown']}, TOTAL={details1['n_total']})")
+    print(f"Occupancy Ratio: {details1['occupancy_ratio']:.3f}")
+    print(f"  (OCCUPIED={details1['n_occupied']}, FREE={details1['n_free']})")
+    print(f"Surface Visibility: {details1['surface_visibility']:.3f}")
+    print(f"Points in Box: {details1['points_in_box']}")
     print(f"Time: {(t1-t0)*1000:.2f} ms")
     
-    # 测试遮挡目标
-    print("\n--- Test 2: Occluded Object ---")
-    bbox2 = np.array([*occ_center, *occ_size, occ_yaw])
+    # 测试2：遮挡目标
+    print("\n" + "-" * 50)
+    print("Test 2: Occluded Object")
+    print("-" * 50)
+    bbox2 = np.array([*car2_center, *car2_size, car2_yaw])
     t0 = time.time()
-    score2, details2 = compute_visibility(bbox2, all_points, sensor)
+    score2, details2 = compute_visibility(bbox2, all_points, sensor, voxel_size=0.2)
     t1 = time.time()
     
     print(f"Score: {score2:.3f} ({classify_visibility(score2)})")
-    print(f"Points in box: {details2['point_count']}")
-    print(f"Point density: {details2['point_density']:.1f} pts/m³")
-    print(f"Voxel occupancy: {details2['voxel_occupancy']:.3f}")
-    print(f"Surface visibility: {details2['surface_visibility']:.3f}")
-    print(f"Depth continuity: {details2['depth_continuity']:.3f}")
+    print(f"Observation Ratio: {details2['observation_ratio']:.3f}")
+    print(f"  (OBSERVED={details2['n_occupied']+details2['n_free']}, "
+          f"UNKNOWN={details2['n_unknown']}, TOTAL={details2['n_total']})")
+    print(f"Occupancy Ratio: {details2['occupancy_ratio']:.3f}")
+    print(f"  (OCCUPIED={details2['n_occupied']}, FREE={details2['n_free']})")
+    print(f"Surface Visibility: {details2['surface_visibility']:.3f}")
+    print(f"Points in Box: {details2['points_in_box']}")
     print(f"Time: {(t1-t0)*1000:.2f} ms")
     
-    # 批量性能测试
-    print("\n--- Test 3: Batch Performance ---")
-    n_boxes = 100
+    # 性能测试
+    print("\n" + "-" * 50)
+    print("Test 3: Batch Performance")
+    print("-" * 50)
+    n_boxes = 50
     test_boxes = np.random.randn(n_boxes, 7)
-    test_boxes[:, :3] *= 25
+    test_boxes[:, :3] *= 20
     test_boxes[:, 3:6] = np.abs(test_boxes[:, 3:6]) * 2 + 1
     test_boxes[:, 6] *= np.pi
     
     t0 = time.time()
-    scores, _ = compute_visibility_batch(test_boxes, all_points, sensor)
+    scores, _ = compute_visibility_batch(test_boxes, all_points, sensor, voxel_size=0.3)
     t1 = time.time()
     
     print(f"Boxes: {n_boxes}")
-    print(f"Total time: {(t1-t0)*1000:.2f} ms")
-    print(f"Per box: {(t1-t0)/n_boxes*1000:.3f} ms")
+    print(f"Total: {(t1-t0)*1000:.1f} ms")
+    print(f"Per box: {(t1-t0)/n_boxes*1000:.2f} ms")
     
-    print("\n" + "=" * 60)
-    print("USAGE:")
-    print("=" * 60)
+    print("\n" + "=" * 65)
+    print("OCC3D-Style Visibility Calculation:")
+    print("=" * 65)
     print("""
-from bbox_visibility import compute_visibility, classify_visibility, warmup
+原理：
+  1. 从传感器向每个点云点发射射线
+  2. 射线穿过的体素 → FREE（空闲）
+  3. 射线终点体素 → OCCUPIED（占用）
+  4. 未被射线触及 → UNKNOWN（未知/遮挡）
 
-# 预热（可选，首次调用前执行）
-warmup()
-
-# 计算单个框
-bbox = [cx, cy, cz, length, width, height, yaw]
-score, details = compute_visibility(bbox, points, sensor_origin)
-
-# 分类
-level = classify_visibility(score)
-
-# 批量计算
-from bbox_visibility import compute_visibility_batch
-scores, details_list = compute_visibility_batch(bboxes, points)
+可见性指标：
+  - observation_ratio = (OCCUPIED + FREE) / TOTAL
+  - occupancy_ratio = OCCUPIED / (OCCUPIED + FREE)
+  
+使用：
+  from bbox_visibility import compute_visibility
+  score, details = compute_visibility(bbox, points, sensor_origin)
 """)
