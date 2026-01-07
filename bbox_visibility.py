@@ -3,98 +3,70 @@
 3D Bounding Box Visibility Calculator (Ray-based, OCC3D Style)
 ================================================================================
 
-版本: 3.0
-基于OCC3D射线投射思想，计算3D标注框的可见性量化指标。
+版本: 4.0 (Performance Optimized)
+基于OCC3D射线投射思想，高效计算3D标注框的可见性。
 
 ================================================================================
-方法描述
+效率优化设计
 ================================================================================
 
-【背景】
-对于360度激光雷达（如Velodyne、Ouster），传感器全方位扫描，物体的
-前/后/左/右各面理论上都可以被观测到。可见性降低的原因是"遮挡"，
-而非"视角"。
+【问题分析】
+对于一帧点云中有N个标注框：
+  - 原始方法：每个框独立做射线投射 → O(N × M × ray_length)
+  - 大量重复计算：同一个点的射线被追踪N次
 
-【核心思想】
-基于OCC3D论文的体素可见性定义：
-  - OCCUPIED：体素反射了LiDAR点（有点云落入）
-  - FREE：体素被LiDAR射线穿透（射线经过但无点停留）
-  - UNKNOWN：既无点云也无射线经过（被遮挡或距离过远）
+【优化策略】
 
-【可见性定义】
-可见性主要取决于"主要面"（Primary Surface）的观测情况：
-  - 主要面 = 面积最大的面（通常是车辆侧面）
-  - 对于bbox尺寸为(L, W, H)的物体：
-    * 侧面(left/right): L × H
-    * 前后面(front/back): W × H  
-    * 顶底面(top/bottom): L × W
+1. 全局体素预计算（关键优化）
+   ┌─────────────────────────────────────────────────────────┐
+   │  预计算阶段（每帧只做一次）：                              │
+   │    - 对整个场景范围建立体素网格                            │
+   │    - 对每个点云点追踪一次射线                              │
+   │    - 标记所有穿过的体素为FREE，终点为OCCUPIED               │
+   │                                                         │
+   │  查询阶段（每个框O(1)查表）：                              │
+   │    - 根据bbox范围，直接查询对应区域的体素状态               │
+   │    - 无需重新计算射线                                     │
+   └─────────────────────────────────────────────────────────┘
 
-【表面权重计算】
-基于表面面积的权重，面积越大权重越高：
+2. 时间复杂度对比
+   ┌────────────────┬──────────────────────────────────────┐
+   │ 方法           │ 复杂度                                │
+   ├────────────────┼──────────────────────────────────────┤
+   │ 原始方法       │ O(N × M × L)，N=框数，M=点数，L=射线长  │
+   │ 优化方法       │ O(M × L) + O(N × V)，V=框内体素数       │
+   └────────────────┴──────────────────────────────────────┘
+   
+   对于典型场景（N=50框，M=100000点）：
+   - 原始：50 × 100000 × 100 = 5亿次操作
+   - 优化：100000 × 100 + 50 × 5000 = 1025万次操作（快50倍）
 
-        ┌─────────────────────────┐
-       /│                        /│
-      / │      TOP (L×W)        / │
-     /  │                      /  │
-    ┌─────────────────────────┐   │
-    │   │                     │   │
-    │   │  BACK               │   │  SIDE
-    │   │  (W×H)              │   │  (L×H)
-    │   └─────────────────────│───┘  ← 最大面
-    │  /                      │  /
-    │ /      BOTTOM           │ /
-    │/       (L×W)            │/
-    └─────────────────────────┘
-           FRONT (W×H)
-
-对于典型车辆 (L=4.5, W=2.0, H=1.5)：
-  - 侧面: 4.5 × 1.5 = 6.75 m²  ← 主要面
-  - 前后: 2.0 × 1.5 = 3.00 m²
-  - 顶底: 4.5 × 2.0 = 9.00 m²  (但底面通常不可见)
-
-【算法流程】
-1. 射线投射：对每个点云点
-   - 从传感器发射射线到该点
-   - 射线经过的体素 → FREE
-   - 射线终点体素 → OCCUPIED
-   - 使用3D Bresenham算法追踪射线路径
-
-2. 表面分析：
-   - 统计各表面区域的体素状态
-   - 各面可见性 = 被观测体素数 / 总体素数
-
-3. 面积加权：
-   - 各面权重 = 面面积 / 总面积（可选排除底面）
-   - 综合可见性 = Σ(面可见性 × 面权重)
-
-4. 主要面评估：
-   - 主要面 = 面积最大的面
-   - 报告主要面的可见性作为关键指标
-
-【输出指标】
-  - visibility_score: 综合可见性分数 [0, 1]
-  - primary_surface: 主要面（面积最大）的名称和可见性
-  - observation_ratio: 总体观测率
-  - surface_details: 各面详细统计
+3. 内存-时间权衡
+   - 全局体素网格需要额外内存
+   - 场景范围[-50,50] × [-50,50] × [-3,5]，体素0.2m
+   - 网格大小：500 × 500 × 40 = 1000万体素 ≈ 10MB（可接受）
 
 ================================================================================
 使用方法
 ================================================================================
 
-from bbox_visibility import compute_visibility, classify_visibility
+【单次使用】（适合少量框）
+    from bbox_visibility import compute_visibility
+    score, details = compute_visibility(bbox, points, sensor)
 
-bbox = [cx, cy, cz, length, width, height, yaw]
-points = np.array(...)  # (N, 3)
-sensor_origin = [0, 0, 1.8]
+【批量使用】（推荐，适合多框场景）
+    from bbox_visibility import VisibilityCalculator
+    
+    # 创建计算器，预计算全局体素（只做一次）
+    calc = VisibilityCalculator(points, sensor_origin, scene_range, voxel_size)
+    
+    # 快速查询各bbox可见性
+    for bbox in bboxes:
+        score, details = calc.query_visibility(bbox)
+    
+    # 或批量查询
+    scores, details_list = calc.query_visibility_batch(bboxes)
 
-score, details = compute_visibility(bbox, points, sensor_origin)
-
-print(f"Score: {score:.2f}")
-print(f"Primary Surface: {details['primary_surface']['name']}")
-print(f"Primary Visibility: {details['primary_surface']['visibility']:.2f}")
-
-================================================================================
-依赖: numpy, numba(可选)
 ================================================================================
 """
 
@@ -102,7 +74,7 @@ import numpy as np
 from typing import Tuple, Dict, List, Optional, Union
 
 try:
-    from numba import njit
+    from numba import njit, prange
     HAS_NUMBA = True
 except ImportError:
     HAS_NUMBA = False
@@ -112,6 +84,7 @@ except ImportError:
         if len(args) == 1 and callable(args[0]):
             return args[0]
         return decorator
+    prange = range
 
 
 # ==================== 常量 ====================
@@ -119,19 +92,18 @@ VOXEL_UNKNOWN = 0
 VOXEL_FREE = 1
 VOXEL_OCCUPIED = 2
 
-# 表面名称: front(+x), back(-x), left(+y), right(-y), top(+z), bottom(-z)
 SURFACE_NAMES = ['front', 'back', 'left', 'right', 'top', 'bottom']
 
 
 # ==================== 3D Bresenham ====================
 
 @njit(cache=True)
-def _bresenham_3d(x0: int, y0: int, z0: int,
-                  x1: int, y1: int, z1: int,
-                  max_steps: int = 5000) -> np.ndarray:
-    """3D Bresenham射线追踪"""
-    result = np.empty((max_steps, 3), dtype=np.int32)
+def _bresenham_3d_inplace(x0: int, y0: int, z0: int,
+                          x1: int, y1: int, z1: int,
+                          result: np.ndarray) -> int:
+    """3D Bresenham，结果写入预分配数组，返回实际长度"""
     count = 0
+    max_steps = result.shape[0]
     
     dx, dy, dz = abs(x1-x0), abs(y1-y0), abs(z1-z0)
     sx = 1 if x1 > x0 else -1
@@ -169,79 +141,161 @@ def _bresenham_3d(x0: int, y0: int, z0: int,
             if err_y > 0: y += sy; err_y -= 2*dz
             err_x += 2*dx; err_y += 2*dy; z += sz
     
-    return result[:count]
+    return count
 
 
-# ==================== 核心计算 ====================
-
-@njit(cache=True)
-def _world_to_voxel(px: float, py: float, pz: float,
-                    cx: float, cy: float, cz: float,
-                    hx: float, hy: float, hz: float,
-                    cos_yaw: float, sin_yaw: float,
-                    voxel_size: float,
-                    nx: int, ny: int, nz: int) -> Tuple[int, int, int, bool]:
-    """世界坐标转体素索引"""
-    dx, dy, dz = px - cx, py - cy, pz - cz
-    local_x = cos_yaw * dx + sin_yaw * dy
-    local_y = -sin_yaw * dx + cos_yaw * dy
-    
-    vx = int((local_x + hx) / voxel_size)
-    vy = int((local_y + hy) / voxel_size)
-    vz = int((dz + hz) / voxel_size)
-    
-    valid = (0 <= vx < nx) and (0 <= vy < ny) and (0 <= vz < nz)
-    return vx, vy, vz, valid
-
+# ==================== 全局体素预计算 ====================
 
 @njit(cache=True)
-def _compute_voxel_states(
+def _precompute_global_voxels(
     points: np.ndarray,
     sensor_x: float, sensor_y: float, sensor_z: float,
-    cx: float, cy: float, cz: float,
-    sx: float, sy: float, sz: float,
-    yaw: float, voxel_size: float,
+    range_min_x: float, range_min_y: float, range_min_z: float,
+    voxel_size: float,
     nx: int, ny: int, nz: int
 ) -> np.ndarray:
-    """射线投射计算体素状态"""
-    voxel_grid = np.zeros(nx * ny * nz, dtype=np.uint8)
+    """预计算全局体素状态（每帧只需调用一次）
     
-    cos_yaw, sin_yaw = np.cos(-yaw), np.sin(-yaw)
-    hx, hy, hz = sx/2, sy/2, sz/2
+    对每个点云点，追踪一次射线，标记：
+    - 射线穿过的体素 → FREE
+    - 射线终点体素 → OCCUPIED
+    """
+    n_total = nx * ny * nz
+    voxel_grid = np.zeros(n_total, dtype=np.uint8)
     
-    sensor_vx, sensor_vy, sensor_vz, _ = _world_to_voxel(
-        sensor_x, sensor_y, sensor_z, cx, cy, cz,
-        hx, hy, hz, cos_yaw, sin_yaw, voxel_size, nx, ny, nz
-    )
+    # 传感器体素坐标
+    sensor_vx = int((sensor_x - range_min_x) / voxel_size)
+    sensor_vy = int((sensor_y - range_min_y) / voxel_size)
+    sensor_vz = int((sensor_z - range_min_z) / voxel_size)
     
-    for i in range(points.shape[0]):
+    # 预分配射线缓冲区
+    ray_buffer = np.empty((5000, 3), dtype=np.int32)
+    
+    n_points = points.shape[0]
+    for i in range(n_points):
         px, py, pz = points[i, 0], points[i, 1], points[i, 2]
-        point_vx, point_vy, point_vz, point_valid = _world_to_voxel(
-            px, py, pz, cx, cy, cz,
-            hx, hy, hz, cos_yaw, sin_yaw, voxel_size, nx, ny, nz
+        
+        # 点的体素坐标
+        point_vx = int((px - range_min_x) / voxel_size)
+        point_vy = int((py - range_min_y) / voxel_size)
+        point_vz = int((pz - range_min_z) / voxel_size)
+        
+        # 检查点是否在范围内
+        point_valid = (0 <= point_vx < nx and 
+                       0 <= point_vy < ny and 
+                       0 <= point_vz < nz)
+        
+        # 射线追踪
+        ray_len = _bresenham_3d_inplace(
+            sensor_vx, sensor_vy, sensor_vz,
+            point_vx, point_vy, point_vz,
+            ray_buffer
         )
         
-        ray = _bresenham_3d(sensor_vx, sensor_vy, sensor_vz,
-                           point_vx, point_vy, point_vz)
-        
-        for j in range(ray.shape[0]):
-            rvx, rvy, rvz = ray[j, 0], ray[j, 1], ray[j, 2]
-            if 0 <= rvx < nx and 0 <= rvy < ny and 0 <= rvz < nz:
-                idx = rvx * ny * nz + rvy * nz + rvz
-                if j == ray.shape[0] - 1 and point_valid:
+        # 标记体素
+        for j in range(ray_len):
+            vx = ray_buffer[j, 0]
+            vy = ray_buffer[j, 1]
+            vz = ray_buffer[j, 2]
+            
+            if 0 <= vx < nx and 0 <= vy < ny and 0 <= vz < nz:
+                idx = vx * ny * nz + vy * nz + vz
+                
+                if j == ray_len - 1 and point_valid:
+                    # 终点：OCCUPIED（优先级最高）
                     voxel_grid[idx] = VOXEL_OCCUPIED
                 elif voxel_grid[idx] == VOXEL_UNKNOWN:
+                    # 路径：FREE（不覆盖OCCUPIED）
                     voxel_grid[idx] = VOXEL_FREE
     
     return voxel_grid
 
 
 @njit(cache=True)
-def _analyze_surfaces(voxel_grid: np.ndarray,
-                      nx: int, ny: int, nz: int,
-                      depth: int) -> np.ndarray:
-    """分析各表面体素状态 -> (6, 3) [observed, occupied, total]"""
-    stats = np.zeros((6, 3), dtype=np.int64)
+def _query_bbox_voxels(
+    global_grid: np.ndarray,
+    global_nx: int, global_ny: int, global_nz: int,
+    range_min_x: float, range_min_y: float, range_min_z: float,
+    voxel_size: float,
+    bbox_center_x: float, bbox_center_y: float, bbox_center_z: float,
+    bbox_size_x: float, bbox_size_y: float, bbox_size_z: float,
+    bbox_yaw: float,
+    surface_depth: int
+) -> Tuple[np.ndarray, int, int, int, int, int, int]:
+    """从全局体素网格中查询bbox区域的体素状态
+    
+    Returns:
+        local_grid: bbox局部体素网格
+        nx, ny, nz: 局部网格尺寸
+        n_occupied, n_free, n_unknown: 各状态数量
+    """
+    # bbox局部网格尺寸
+    local_nx = max(1, int(np.ceil(bbox_size_x / voxel_size)))
+    local_ny = max(1, int(np.ceil(bbox_size_y / voxel_size)))
+    local_nz = max(1, int(np.ceil(bbox_size_z / voxel_size)))
+    local_total = local_nx * local_ny * local_nz
+    
+    local_grid = np.zeros(local_total, dtype=np.uint8)
+    
+    cos_yaw = np.cos(bbox_yaw)
+    sin_yaw = np.sin(bbox_yaw)
+    
+    half_x = bbox_size_x / 2
+    half_y = bbox_size_y / 2
+    half_z = bbox_size_z / 2
+    
+    n_occupied = 0
+    n_free = 0
+    n_unknown = 0
+    
+    # 遍历局部体素
+    for lx in range(local_nx):
+        for ly in range(local_ny):
+            for lz in range(local_nz):
+                # 局部坐标（bbox坐标系）
+                local_px = (lx + 0.5) * voxel_size - half_x
+                local_py = (ly + 0.5) * voxel_size - half_y
+                local_pz = (lz + 0.5) * voxel_size - half_z
+                
+                # 转换到全局坐标
+                global_px = cos_yaw * local_px - sin_yaw * local_py + bbox_center_x
+                global_py = sin_yaw * local_px + cos_yaw * local_py + bbox_center_y
+                global_pz = local_pz + bbox_center_z
+                
+                # 全局体素索引
+                gx = int((global_px - range_min_x) / voxel_size)
+                gy = int((global_py - range_min_y) / voxel_size)
+                gz = int((global_pz - range_min_z) / voxel_size)
+                
+                # 查询全局网格
+                if 0 <= gx < global_nx and 0 <= gy < global_ny and 0 <= gz < global_nz:
+                    global_idx = gx * global_ny * global_nz + gy * global_nz + gz
+                    state = global_grid[global_idx]
+                else:
+                    state = VOXEL_UNKNOWN
+                
+                # 存储到局部网格
+                local_idx = lx * local_ny * local_nz + ly * local_nz + lz
+                local_grid[local_idx] = state
+                
+                if state == VOXEL_OCCUPIED:
+                    n_occupied += 1
+                elif state == VOXEL_FREE:
+                    n_free += 1
+                else:
+                    n_unknown += 1
+    
+    return local_grid, local_nx, local_ny, local_nz, n_occupied, n_free, n_unknown
+
+
+@njit(cache=True)
+def _analyze_local_surfaces(
+    local_grid: np.ndarray,
+    nx: int, ny: int, nz: int,
+    depth: int
+) -> np.ndarray:
+    """分析局部网格的各表面状态"""
+    stats = np.zeros((6, 3), dtype=np.int64)  # [observed, occupied, total]
     
     # front (+x)
     for x in range(max(0, nx-depth), nx):
@@ -249,8 +303,8 @@ def _analyze_surfaces(voxel_grid: np.ndarray,
             for z in range(nz):
                 idx = x*ny*nz + y*nz + z
                 stats[0, 2] += 1
-                if voxel_grid[idx] != VOXEL_UNKNOWN: stats[0, 0] += 1
-                if voxel_grid[idx] == VOXEL_OCCUPIED: stats[0, 1] += 1
+                if local_grid[idx] != VOXEL_UNKNOWN: stats[0, 0] += 1
+                if local_grid[idx] == VOXEL_OCCUPIED: stats[0, 1] += 1
     
     # back (-x)
     for x in range(min(nx, depth)):
@@ -258,8 +312,8 @@ def _analyze_surfaces(voxel_grid: np.ndarray,
             for z in range(nz):
                 idx = x*ny*nz + y*nz + z
                 stats[1, 2] += 1
-                if voxel_grid[idx] != VOXEL_UNKNOWN: stats[1, 0] += 1
-                if voxel_grid[idx] == VOXEL_OCCUPIED: stats[1, 1] += 1
+                if local_grid[idx] != VOXEL_UNKNOWN: stats[1, 0] += 1
+                if local_grid[idx] == VOXEL_OCCUPIED: stats[1, 1] += 1
     
     # left (+y)
     for x in range(nx):
@@ -267,8 +321,8 @@ def _analyze_surfaces(voxel_grid: np.ndarray,
             for z in range(nz):
                 idx = x*ny*nz + y*nz + z
                 stats[2, 2] += 1
-                if voxel_grid[idx] != VOXEL_UNKNOWN: stats[2, 0] += 1
-                if voxel_grid[idx] == VOXEL_OCCUPIED: stats[2, 1] += 1
+                if local_grid[idx] != VOXEL_UNKNOWN: stats[2, 0] += 1
+                if local_grid[idx] == VOXEL_OCCUPIED: stats[2, 1] += 1
     
     # right (-y)
     for x in range(nx):
@@ -276,8 +330,8 @@ def _analyze_surfaces(voxel_grid: np.ndarray,
             for z in range(nz):
                 idx = x*ny*nz + y*nz + z
                 stats[3, 2] += 1
-                if voxel_grid[idx] != VOXEL_UNKNOWN: stats[3, 0] += 1
-                if voxel_grid[idx] == VOXEL_OCCUPIED: stats[3, 1] += 1
+                if local_grid[idx] != VOXEL_UNKNOWN: stats[3, 0] += 1
+                if local_grid[idx] == VOXEL_OCCUPIED: stats[3, 1] += 1
     
     # top (+z)
     for x in range(nx):
@@ -285,8 +339,8 @@ def _analyze_surfaces(voxel_grid: np.ndarray,
             for z in range(max(0, nz-depth), nz):
                 idx = x*ny*nz + y*nz + z
                 stats[4, 2] += 1
-                if voxel_grid[idx] != VOXEL_UNKNOWN: stats[4, 0] += 1
-                if voxel_grid[idx] == VOXEL_OCCUPIED: stats[4, 1] += 1
+                if local_grid[idx] != VOXEL_UNKNOWN: stats[4, 0] += 1
+                if local_grid[idx] == VOXEL_OCCUPIED: stats[4, 1] += 1
     
     # bottom (-z)
     for x in range(nx):
@@ -294,54 +348,208 @@ def _analyze_surfaces(voxel_grid: np.ndarray,
             for z in range(min(nz, depth)):
                 idx = x*ny*nz + y*nz + z
                 stats[5, 2] += 1
-                if voxel_grid[idx] != VOXEL_UNKNOWN: stats[5, 0] += 1
-                if voxel_grid[idx] == VOXEL_OCCUPIED: stats[5, 1] += 1
+                if local_grid[idx] != VOXEL_UNKNOWN: stats[5, 0] += 1
+                if local_grid[idx] == VOXEL_OCCUPIED: stats[5, 1] += 1
     
     return stats
 
 
-def _compute_surface_areas(size: np.ndarray) -> np.ndarray:
-    """计算各表面面积
+# ==================== 可见性计算器类 ====================
+
+class VisibilityCalculator:
+    """高效的可见性计算器（推荐用于多框场景）
     
-    size = [length(x), width(y), height(z)]
+    【使用方法】
+    calc = VisibilityCalculator(points, sensor_origin, scene_range, voxel_size)
     
-    Returns:
-        areas: (6,) [front, back, left, right, top, bottom]
+    # 单个查询
+    score, details = calc.query_visibility(bbox)
+    
+    # 批量查询
+    scores, details_list = calc.query_visibility_batch(bboxes)
+    
+    【效率对比】
+    - 原始方法：每个框重新计算射线 → O(N × M)
+    - 本方法：预计算一次，快速查询 → O(M) + O(N × V)
     """
-    L, W, H = size[0], size[1], size[2]
-    return np.array([
-        W * H,  # front (+x): width × height
-        W * H,  # back (-x): width × height
-        L * H,  # left (+y): length × height
-        L * H,  # right (-y): length × height
-        L * W,  # top (+z): length × width
-        L * W,  # bottom (-z): length × width
-    ])
+    
+    def __init__(self,
+                 points: np.ndarray,
+                 sensor_origin: np.ndarray,
+                 scene_range: Optional[List] = None,
+                 voxel_size: float = 0.2):
+        """初始化计算器，预计算全局体素
+        
+        Args:
+            points: (N, 3) 点云
+            sensor_origin: (3,) 传感器位置
+            scene_range: [min_x, min_y, min_z, max_x, max_y, max_z]
+                        默认根据点云自动推断
+            voxel_size: 体素大小（米）
+        """
+        self.points = np.asarray(points[:, :3], dtype=np.float64)
+        self.sensor_origin = np.asarray(sensor_origin, dtype=np.float64)
+        self.voxel_size = voxel_size
+        
+        # 自动推断场景范围（限制最大范围避免内存爆炸）
+        if scene_range is None:
+            # 使用合理的默认范围（适合自动驾驶场景）
+            # 典型范围：[-50, 50] x [-50, 50] x [-3, 5]
+            max_range = 60.0  # 最大范围限制
+            max_z_range = 10.0
+            
+            pts_min = np.min(self.points, axis=0)
+            pts_max = np.max(self.points, axis=0)
+            
+            # 限制范围
+            x_min = max(-max_range, min(pts_min[0], sensor_origin[0]) - 2)
+            y_min = max(-max_range, min(pts_min[1], sensor_origin[1]) - 2)
+            z_min = max(-max_z_range, min(pts_min[2], sensor_origin[2]) - 1)
+            x_max = min(max_range, max(pts_max[0], sensor_origin[0]) + 2)
+            y_max = min(max_range, max(pts_max[1], sensor_origin[1]) + 2)
+            z_max = min(max_z_range, max(pts_max[2], sensor_origin[2]) + 1)
+            
+            scene_range = [x_min, y_min, z_min, x_max, y_max, z_max]
+        
+        self.range_min = np.array(scene_range[:3], dtype=np.float64)
+        self.range_max = np.array(scene_range[3:], dtype=np.float64)
+        
+        # 计算网格尺寸
+        self.nx = int(np.ceil((self.range_max[0] - self.range_min[0]) / voxel_size))
+        self.ny = int(np.ceil((self.range_max[1] - self.range_min[1]) / voxel_size))
+        self.nz = int(np.ceil((self.range_max[2] - self.range_min[2]) / voxel_size))
+        
+        # 预计算全局体素（关键步骤）
+        self.global_grid = _precompute_global_voxels(
+            self.points,
+            self.sensor_origin[0], self.sensor_origin[1], self.sensor_origin[2],
+            self.range_min[0], self.range_min[1], self.range_min[2],
+            self.voxel_size,
+            self.nx, self.ny, self.nz
+        )
+        
+        # 统计
+        self.n_total_voxels = self.nx * self.ny * self.nz
+        self.n_occupied = int(np.sum(self.global_grid == VOXEL_OCCUPIED))
+        self.n_free = int(np.sum(self.global_grid == VOXEL_FREE))
+        self.n_unknown = self.n_total_voxels - self.n_occupied - self.n_free
+    
+    def query_visibility(self,
+                        bbox: Union[np.ndarray, List],
+                        surface_depth: int = 2,
+                        exclude_bottom: bool = True) -> Tuple[float, Dict]:
+        """查询单个bbox的可见性（快速，不重新计算射线）
+        
+        Args:
+            bbox: (7,) [cx, cy, cz, length, width, height, yaw]
+            surface_depth: 表面分析深度
+            exclude_bottom: 是否排除底面
+        
+        Returns:
+            score: 可见性分数
+            details: 详细指标
+        """
+        bbox = np.asarray(bbox, dtype=np.float64)
+        center = bbox[:3]
+        size = bbox[3:6]
+        yaw = bbox[6]
+        
+        # 从全局网格查询bbox区域
+        local_grid, lnx, lny, lnz, n_occ, n_free, n_unk = _query_bbox_voxels(
+            self.global_grid,
+            self.nx, self.ny, self.nz,
+            self.range_min[0], self.range_min[1], self.range_min[2],
+            self.voxel_size,
+            center[0], center[1], center[2],
+            size[0], size[1], size[2],
+            yaw, surface_depth
+        )
+        
+        n_total = lnx * lny * lnz
+        
+        # 表面分析
+        surface_stats = _analyze_local_surfaces(local_grid, lnx, lny, lnz, surface_depth)
+        
+        # 面积权重
+        L, W, H = size[0], size[1], size[2]
+        areas = np.array([W*H, W*H, L*H, L*H, L*W, L*W])
+        weights = areas.copy()
+        if exclude_bottom:
+            weights[5] = 0
+        weights = weights / np.sum(weights)
+        
+        # 各面可见性
+        surface_vis = np.zeros(6)
+        surface_details = {}
+        for i, name in enumerate(SURFACE_NAMES):
+            obs = int(surface_stats[i, 0])
+            occ = int(surface_stats[i, 1])
+            tot = int(surface_stats[i, 2])
+            vis = obs / max(1, tot)
+            surface_vis[i] = vis
+            surface_details[name] = {
+                'visibility': float(vis),
+                'observed': obs,
+                'occupied': occ,
+                'total': tot,
+                'area': float(areas[i]),
+                'weight': float(weights[i]),
+            }
+        
+        # 加权分数
+        score = float(np.sum(surface_vis * weights))
+        
+        # 主要面
+        effective_areas = areas.copy()
+        if exclude_bottom:
+            effective_areas[5] = 0
+        primary_idx = int(np.argmax(effective_areas))
+        
+        details = {
+            'visibility_score': score,
+            'primary_surface': {
+                'name': SURFACE_NAMES[primary_idx],
+                'visibility': float(surface_vis[primary_idx]),
+                'area': float(areas[primary_idx]),
+            },
+            'observation_ratio': float((n_occ + n_free) / max(1, n_total)),
+            'n_occupied': n_occ,
+            'n_free': n_free,
+            'n_unknown': n_unk,
+            'n_total': n_total,
+            'surface_details': surface_details,
+        }
+        
+        return score, details
+    
+    def query_visibility_batch(self,
+                               bboxes: np.ndarray,
+                               surface_depth: int = 2,
+                               exclude_bottom: bool = True) -> Tuple[np.ndarray, List[Dict]]:
+        """批量查询多个bbox"""
+        bboxes = np.asarray(bboxes, dtype=np.float64)
+        n = bboxes.shape[0]
+        scores = np.zeros(n)
+        details_list = []
+        for i in range(n):
+            s, d = self.query_visibility(bboxes[i], surface_depth, exclude_bottom)
+            scores[i] = s
+            details_list.append(d)
+        return scores, details_list
+    
+    def get_stats(self) -> Dict:
+        """获取全局体素统计"""
+        return {
+            'grid_shape': (self.nx, self.ny, self.nz),
+            'n_total_voxels': self.n_total_voxels,
+            'n_occupied': self.n_occupied,
+            'n_free': self.n_free,
+            'n_unknown': self.n_unknown,
+            'memory_mb': self.global_grid.nbytes / 1024 / 1024,
+        }
 
 
-def _compute_area_weights(size: np.ndarray, exclude_bottom: bool = True) -> np.ndarray:
-    """基于面积计算各面权重
-    
-    Args:
-        size: bbox尺寸 [L, W, H]
-        exclude_bottom: 是否排除底面（通常被地面遮挡）
-    
-    Returns:
-        weights: (6,) 归一化权重
-    """
-    areas = _compute_surface_areas(size)
-    
-    if exclude_bottom:
-        areas[5] = 0  # bottom权重设为0
-    
-    total = np.sum(areas)
-    if total > 1e-6:
-        return areas / total
-    else:
-        return np.ones(6) / 6
-
-
-# ==================== 主函数 ====================
+# ==================== 便捷函数（兼容旧接口） ====================
 
 def compute_visibility(
     bbox: Union[np.ndarray, List],
@@ -351,129 +559,15 @@ def compute_visibility(
     surface_depth: int = 2,
     exclude_bottom: bool = True
 ) -> Tuple[float, Dict]:
-    """计算3D标注框的可见性（基于OCC3D射线投射 + 面积加权）
+    """计算单个bbox可见性（适合少量框，每次调用都会重新计算）
     
-    【方法】
-    1. 射线投射：360度雷达，所有方向都可能观测到
-       - 穿过的体素 → FREE（空闲）
-       - 终点体素 → OCCUPIED（占用）
-       - 未触及 → UNKNOWN（被遮挡）
-    
-    2. 面积加权：根据各面面积分配权重
-       - 面积大的面（如侧面）权重高
-       - 底面通常被地面挡住，权重设为0
-    
-    3. 主要面：面积最大的面，其可见性是关键指标
-    
-    Args:
-        bbox: (7,) [cx, cy, cz, length, width, height, yaw]
-        points: (N, 3) 点云
-        sensor_origin: (3,) 传感器位置
-        voxel_size: 体素大小（米）
-        surface_depth: 表面分析深度（体素层数）
-        exclude_bottom: 是否排除底面
-    
-    Returns:
-        score: 面积加权可见性分数 [0, 1]
-        details: 详细指标
+    注意：如果有多个框，建议使用 VisibilityCalculator 类以获得更好性能。
     """
     if sensor_origin is None:
         sensor_origin = np.array([0.0, 0.0, 0.0])
     
-    bbox = np.asarray(bbox, dtype=np.float64)
-    points = np.asarray(points[:, :3], dtype=np.float64).copy()
-    sensor_origin = np.asarray(sensor_origin, dtype=np.float64)
-    
-    center = bbox[:3]
-    size = bbox[3:6]
-    yaw = bbox[6]
-    
-    nx = max(1, int(np.ceil(size[0] / voxel_size)))
-    ny = max(1, int(np.ceil(size[1] / voxel_size)))
-    nz = max(1, int(np.ceil(size[2] / voxel_size)))
-    n_total = nx * ny * nz
-    
-    # 射线投射
-    voxel_grid = _compute_voxel_states(
-        points,
-        sensor_origin[0], sensor_origin[1], sensor_origin[2],
-        center[0], center[1], center[2],
-        size[0], size[1], size[2],
-        yaw, voxel_size, nx, ny, nz
-    )
-    
-    # 全局统计
-    n_occupied = int(np.sum(voxel_grid == VOXEL_OCCUPIED))
-    n_free = int(np.sum(voxel_grid == VOXEL_FREE))
-    n_unknown = n_total - n_occupied - n_free
-    
-    # 表面分析
-    surface_stats = _analyze_surfaces(voxel_grid, nx, ny, nz, surface_depth)
-    
-    # 面积权重
-    surface_areas = _compute_surface_areas(size)
-    surface_weights = _compute_area_weights(size, exclude_bottom)
-    
-    # 各面可见性
-    surface_visibility = np.zeros(6)
-    surface_details = {}
-    
-    for i, name in enumerate(SURFACE_NAMES):
-        observed = int(surface_stats[i, 0])
-        occupied = int(surface_stats[i, 1])
-        total = int(surface_stats[i, 2])
-        
-        vis = observed / max(1, total)
-        surface_visibility[i] = vis
-        
-        surface_details[name] = {
-            'visibility': float(vis),
-            'observed': observed,
-            'occupied': occupied,
-            'total': total,
-            'area': float(surface_areas[i]),
-            'weight': float(surface_weights[i]),
-        }
-    
-    # 面积加权可见性
-    weighted_visibility = float(np.sum(surface_visibility * surface_weights))
-    
-    # 主要面（面积最大，排除底面）
-    effective_areas = surface_areas.copy()
-    if exclude_bottom:
-        effective_areas[5] = 0
-    primary_idx = int(np.argmax(effective_areas))
-    primary_name = SURFACE_NAMES[primary_idx]
-    primary_visibility = surface_visibility[primary_idx]
-    
-    details = {
-        'visibility_score': weighted_visibility,
-        
-        # 主要面（面积最大）
-        'primary_surface': {
-            'name': primary_name,
-            'visibility': float(primary_visibility),
-            'area': float(surface_areas[primary_idx]),
-            'weight': float(surface_weights[primary_idx]),
-        },
-        
-        # 全局统计
-        'observation_ratio': float((n_occupied + n_free) / max(1, n_total)),
-        'n_occupied': n_occupied,
-        'n_free': n_free,
-        'n_unknown': n_unknown,
-        'n_total': n_total,
-        'voxel_shape': (nx, ny, nz),
-        
-        # 各面详情
-        'surface_areas': {name: float(surface_areas[i]) 
-                         for i, name in enumerate(SURFACE_NAMES)},
-        'surface_weights': {name: float(surface_weights[i]) 
-                           for i, name in enumerate(SURFACE_NAMES)},
-        'surface_details': surface_details,
-    }
-    
-    return weighted_visibility, details
+    calc = VisibilityCalculator(points, sensor_origin, voxel_size=voxel_size)
+    return calc.query_visibility(bbox, surface_depth, exclude_bottom)
 
 
 def compute_visibility_batch(
@@ -482,151 +576,153 @@ def compute_visibility_batch(
     sensor_origin: Optional[np.ndarray] = None,
     voxel_size: float = 0.2
 ) -> Tuple[np.ndarray, List[Dict]]:
-    """批量计算"""
-    bboxes = np.asarray(bboxes, dtype=np.float64)
-    n = bboxes.shape[0]
-    scores = np.zeros(n)
-    details_list = []
-    for i in range(n):
-        s, d = compute_visibility(bboxes[i], points, sensor_origin, voxel_size)
-        scores[i] = s
-        details_list.append(d)
-    return scores, details_list
+    """批量计算（内部使用优化版本）"""
+    if sensor_origin is None:
+        sensor_origin = np.array([0.0, 0.0, 0.0])
+    
+    calc = VisibilityCalculator(points, sensor_origin, voxel_size=voxel_size)
+    return calc.query_visibility_batch(bboxes)
 
 
 def classify_visibility(score: float) -> str:
     """可见性等级"""
-    if score >= 0.7:
-        return "FULLY_VISIBLE"
-    elif score >= 0.4:
-        return "MOSTLY_VISIBLE"
-    elif score >= 0.2:
-        return "PARTIALLY_VISIBLE"
-    elif score > 0.05:
-        return "MOSTLY_OCCLUDED"
-    else:
-        return "FULLY_OCCLUDED"
+    if score >= 0.7: return "FULLY_VISIBLE"
+    elif score >= 0.4: return "MOSTLY_VISIBLE"
+    elif score >= 0.2: return "PARTIALLY_VISIBLE"
+    elif score > 0.05: return "MOSTLY_OCCLUDED"
+    else: return "FULLY_OCCLUDED"
 
 
 def warmup():
     """预热JIT"""
     if not HAS_NUMBA:
         return
-    pts = np.random.randn(50, 3).astype(np.float64) * 5
-    bbox = np.array([2, 2, 1, 3, 2, 1.5, 0], dtype=np.float64)
+    pts = np.random.randn(100, 3).astype(np.float64) * 10
     sensor = np.array([0, 0, 1.5], dtype=np.float64)
-    compute_visibility(bbox, pts, sensor, voxel_size=0.5)
+    calc = VisibilityCalculator(pts, sensor, voxel_size=0.5)
+    bbox = np.array([5, 5, 1, 3, 2, 1.5, 0], dtype=np.float64)
+    calc.query_visibility(bbox)
 
 
-# ==================== 测试 ====================
+# ==================== 测试与性能评估 ====================
 
 if __name__ == '__main__':
     import time
     
     print("=" * 70)
-    print("3D BBox Visibility Calculator (Ray-based, Area-Weighted)")
+    print("3D BBox Visibility Calculator - Performance Optimized (v4.0)")
     print("=" * 70)
     print(f"Numba: {HAS_NUMBA}")
-    print("\n【方法说明】")
-    print("- 360度雷达全方位扫描，前后左右都可能被观测到")
-    print("- 基于各面面积分配权重，面积大的面（侧面）权重高")
-    print("- 主要面 = 面积最大的面，其可见性是关键指标")
     
     np.random.seed(42)
+    
+    # 模拟真实场景
+    print("\n【场景设置】")
+    n_points = 100000  # 10万点云
+    n_boxes = 50       # 50个框
+    
+    print(f"点云数量: {n_points:,}")
+    print(f"标注框数量: {n_boxes}")
+    
+    # 生成点云（限制在合理范围内，模拟真实LiDAR）
+    points = np.random.randn(n_points, 3)
+    points[:, 0] = points[:, 0] * 25  # x: [-50, 50]
+    points[:, 1] = points[:, 1] * 25  # y: [-50, 50]
+    points[:, 2] = np.abs(points[:, 2]) * 1.5 - 0.5  # z: [-0.5, 4]
+    
+    # 生成框
+    bboxes = np.zeros((n_boxes, 7))
+    bboxes[:, 0] = np.random.uniform(-40, 40, n_boxes)  # x
+    bboxes[:, 1] = np.random.uniform(-40, 40, n_boxes)  # y
+    bboxes[:, 2] = np.random.uniform(0, 2, n_boxes)     # z
+    bboxes[:, 3] = np.random.uniform(3, 5, n_boxes)     # length
+    bboxes[:, 4] = np.random.uniform(1.5, 2.5, n_boxes) # width
+    bboxes[:, 5] = np.random.uniform(1.2, 2, n_boxes)   # height
+    bboxes[:, 6] = np.random.uniform(-np.pi, np.pi, n_boxes)  # yaw
+    
     sensor = np.array([0, 0, 1.8])
     
-    # 背景
-    bg = np.random.randn(3000, 3) * 25
-    bg[:, 2] = np.abs(bg[:, 2]) * 0.3 - 0.5
-    
-    # 车辆尺寸
-    car_size = np.array([4.5, 2.0, 1.5])  # L, W, H
-    print(f"\n车辆尺寸: L={car_size[0]}, W={car_size[1]}, H={car_size[2]}")
-    print("各面面积:")
-    areas = _compute_surface_areas(car_size)
-    weights = _compute_area_weights(car_size, exclude_bottom=True)
-    for i, name in enumerate(SURFACE_NAMES):
-        print(f"  {name:8s}: area={areas[i]:.2f}m², weight={weights[i]:.3f}")
-    
-    # 可见车辆
-    car1_center = np.array([10, 3, 0.8])
-    car1_yaw = 0.1
-    car1_pts = []
-    for _ in range(300):
-        face = np.random.randint(6)
-        hs = car_size / 2
-        if face == 0: p = [hs[0], np.random.uniform(-1,1)*hs[1], np.random.uniform(-1,1)*hs[2]]
-        elif face == 1: p = [-hs[0], np.random.uniform(-1,1)*hs[1], np.random.uniform(-1,1)*hs[2]]
-        elif face == 2: p = [np.random.uniform(-1,1)*hs[0], hs[1], np.random.uniform(-1,1)*hs[2]]
-        elif face == 3: p = [np.random.uniform(-1,1)*hs[0], -hs[1], np.random.uniform(-1,1)*hs[2]]
-        elif face == 4: p = [np.random.uniform(-1,1)*hs[0], np.random.uniform(-1,1)*hs[1], hs[2]]
-        else: p = [np.random.uniform(-1,1)*hs[0], np.random.uniform(-1,1)*hs[1], -hs[2]]
-        car1_pts.append(p)
-    car1_pts = np.array(car1_pts)
-    c, s = np.cos(car1_yaw), np.sin(car1_yaw)
-    car1_rot = np.zeros_like(car1_pts)
-    car1_rot[:, 0] = c * car1_pts[:, 0] - s * car1_pts[:, 1]
-    car1_rot[:, 1] = s * car1_pts[:, 0] + c * car1_pts[:, 1]
-    car1_rot[:, 2] = car1_pts[:, 2]
-    car1_world = car1_rot + car1_center
-    
-    # 遮挡车辆
-    car2_center = np.array([35, -8, 0.8])
-    car2_yaw = -0.2
-    car2_pts = np.random.randn(20, 3) * 0.15 + car2_center
-    
-    all_points = np.vstack([bg, car1_world, car2_pts])
-    
-    print("\n" + "Warming up...")
+    # 预热
+    print("\n【预热JIT编译】")
     warmup()
+    print("完成")
     
-    # 测试1
+    # ========== 方法1：原始方法（每框独立计算）==========
     print("\n" + "-" * 60)
-    print("Test 1: Visible Object (360° LiDAR)")
+    print("方法1：原始方法（每框独立计算）")
     print("-" * 60)
-    bbox1 = np.array([*car1_center, *car_size, car1_yaw])
-    t0 = time.time()
-    score1, d1 = compute_visibility(bbox1, all_points, sensor, voxel_size=0.2)
-    t1 = time.time()
-    
-    print(f"Visibility Score: {score1:.3f} ({classify_visibility(score1)})")
-    print(f"Primary Surface: {d1['primary_surface']['name']} "
-          f"(area={d1['primary_surface']['area']:.2f}m², "
-          f"visibility={d1['primary_surface']['visibility']:.2f})")
-    print(f"\nAll Surfaces (area-weighted):")
-    for name in SURFACE_NAMES:
-        sd = d1['surface_details'][name]
-        print(f"  {name:8s}: vis={sd['visibility']:.3f}, "
-              f"area={sd['area']:.2f}m², weight={sd['weight']:.3f}")
-    print(f"\nTime: {(t1-t0)*1000:.2f} ms")
-    
-    # 测试2
-    print("\n" + "-" * 60)
-    print("Test 2: Occluded Object")
-    print("-" * 60)
-    bbox2 = np.array([*car2_center, *car_size, car2_yaw])
-    t0 = time.time()
-    score2, d2 = compute_visibility(bbox2, all_points, sensor, voxel_size=0.2)
-    t1 = time.time()
-    
-    print(f"Visibility Score: {score2:.3f} ({classify_visibility(score2)})")
-    print(f"Primary Surface: {d2['primary_surface']['name']} "
-          f"(visibility={d2['primary_surface']['visibility']:.2f})")
-    print(f"Time: {(t1-t0)*1000:.2f} ms")
-    
-    # 性能
-    print("\n" + "-" * 60)
-    print("Test 3: Batch Performance")
-    print("-" * 60)
-    n_boxes = 50
-    test_boxes = np.random.randn(n_boxes, 7)
-    test_boxes[:, :3] *= 20
-    test_boxes[:, 3:6] = np.abs(test_boxes[:, 3:6]) * 2 + 1
-    test_boxes[:, 6] *= np.pi
     
     t0 = time.time()
-    scores, _ = compute_visibility_batch(test_boxes, all_points, sensor)
+    scores_v1 = []
+    for bbox in bboxes[:10]:  # 只测10个，否则太慢
+        calc = VisibilityCalculator(points, sensor, voxel_size=0.2)
+        s, _ = calc.query_visibility(bbox)
+        scores_v1.append(s)
     t1 = time.time()
-    print(f"Boxes: {n_boxes}, Total: {(t1-t0)*1000:.1f}ms, Per box: {(t1-t0)/n_boxes*1000:.2f}ms")
+    
+    time_per_box_v1 = (t1 - t0) / 10 * 1000
+    estimated_total_v1 = time_per_box_v1 * n_boxes
+    print(f"每框耗时: {time_per_box_v1:.1f} ms")
+    print(f"预估{n_boxes}框总耗时: {estimated_total_v1:.1f} ms")
+    
+    # ========== 方法2：优化方法（预计算+查询）==========
+    print("\n" + "-" * 60)
+    print("方法2：优化方法（预计算一次 + 快速查询）")
+    print("-" * 60)
+    
+    # 预计算
+    t0 = time.time()
+    calc = VisibilityCalculator(points, sensor, voxel_size=0.2)
+    t_precompute = time.time() - t0
+    
+    print(f"预计算耗时: {t_precompute*1000:.1f} ms")
+    stats = calc.get_stats()
+    print(f"全局体素网格: {stats['grid_shape']}")
+    print(f"体素总数: {stats['n_total_voxels']:,}")
+    print(f"内存占用: {stats['memory_mb']:.2f} MB")
+    print(f"  OCCUPIED: {stats['n_occupied']:,}")
+    print(f"  FREE: {stats['n_free']:,}")
+    print(f"  UNKNOWN: {stats['n_unknown']:,}")
+    
+    # 批量查询
+    t0 = time.time()
+    scores_v2, details = calc.query_visibility_batch(bboxes)
+    t_query = time.time() - t0
+    
+    print(f"\n查询{n_boxes}框耗时: {t_query*1000:.1f} ms")
+    print(f"每框查询耗时: {t_query/n_boxes*1000:.3f} ms")
+    
+    total_v2 = (t_precompute + t_query) * 1000
+    print(f"总耗时（预计算+查询）: {total_v2:.1f} ms")
+    
+    # ========== 性能对比 ==========
+    print("\n" + "=" * 60)
+    print("【性能对比】")
+    print("=" * 60)
+    print(f"原始方法预估: {estimated_total_v1:.1f} ms")
+    print(f"优化方法实际: {total_v2:.1f} ms")
+    print(f"加速比: {estimated_total_v1/total_v2:.1f}x")
+    
+    # 结果验证
+    print("\n【结果样例】")
+    for i in range(min(5, n_boxes)):
+        print(f"Box {i}: score={scores_v2[i]:.3f} ({classify_visibility(scores_v2[i])})")
     
     print("\n" + "=" * 70)
+    print("【使用建议】")
+    print("=" * 70)
+    print("""
+对于单帧多框场景，推荐使用 VisibilityCalculator：
+
+    from bbox_visibility import VisibilityCalculator
+    
+    # 创建计算器（预计算全局体素，只做一次）
+    calc = VisibilityCalculator(points, sensor_origin, voxel_size=0.2)
+    
+    # 快速查询各bbox
+    scores, details = calc.query_visibility_batch(bboxes)
+    
+    # 或逐个查询
+    for bbox in bboxes:
+        score, detail = calc.query_visibility(bbox)
+""")
