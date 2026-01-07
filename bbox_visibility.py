@@ -11,6 +11,22 @@
                    ↑
                 其他点云
 
+【射线宽度 - 角度阈值】
+由于点云稀疏性，使用角度阈值定义射线宽度，宽度随距离自适应：
+
+    传感器 ●
+            ╲  angle_thresh (如1°)
+             ╲
+              ═══════════════════→
+             ╱    射线"锥体"
+            ╱
+           
+    宽度 = 距离 × tan(angle)
+    10m处: ~0.17m
+    50m处: ~0.87m
+    
+    这符合激光雷达"近密远疏"的特性。
+
 【可见性定义】
             未被遮挡的框内点数
 可见性 = ─────────────────────
@@ -74,12 +90,18 @@ def _check_ray_occlusion(
     target_pt,          # 目标点 (3,)
     sensor,             # 传感器位置 (3,)
     other_points,       # 其他点云 (M, 3)
-    occlusion_thresh,   # 遮挡判定阈值
-    min_occluders       # 最少遮挡点数（避免单点误判）
+    angle_thresh,       # 角度阈值（弧度）
+    min_occluders       # 最少遮挡点数
 ):
     """检查从sensor到target_pt的射线是否被other_points遮挡
     
-    改进：需要多个点在射线附近才算遮挡，避免单点噪声误判
+    【改进】使用角度阈值而非固定距离
+    
+    射线宽度随距离自适应：
+        近处(10m): 宽度 ≈ 10m × tan(1°) ≈ 0.17m
+        远处(50m): 宽度 ≈ 50m × tan(1°) ≈ 0.87m
+    
+    这符合激光雷达点云"近密远疏"的特性。
     
     Returns:
         True: 被遮挡
@@ -97,19 +119,21 @@ def _check_ray_occlusion(
     dir_y = dy / ray_len
     dir_z = dz / ray_len
     
-    thresh_sq = occlusion_thresh * occlusion_thresh
-    occluder_count = 0
+    # tan(angle_thresh) 用于计算距离阈值
+    tan_thresh = np.tan(angle_thresh)
     
+    occluder_count = 0
     n = other_points.shape[0]
+    
     for i in range(n):
         px = other_points[i,0] - sensor[0]
         py = other_points[i,1] - sensor[1]
         pz = other_points[i,2] - sensor[2]
         
-        # 投影长度
+        # 投影长度（点到传感器的距离在射线方向的投影）
         proj = px*dir_x + py*dir_y + pz*dir_z
         
-        # 只考虑在sensor和target之间的点（留margin避免边界问题）
+        # 只考虑在sensor和target之间的点
         if proj <= 1.0 or proj >= ray_len - 0.5:
             continue
         
@@ -117,9 +141,14 @@ def _check_ray_occlusion(
         closest_x = proj * dir_x
         closest_y = proj * dir_y
         closest_z = proj * dir_z
-        dist_sq = (px-closest_x)**2 + (py-closest_y)**2 + (pz-closest_z)**2
+        perp_dist_sq = (px-closest_x)**2 + (py-closest_y)**2 + (pz-closest_z)**2
         
-        if dist_sq < thresh_sq:
+        # 动态阈值：随距离增加而增加
+        # thresh = proj × tan(angle_thresh)
+        dynamic_thresh = proj * tan_thresh
+        thresh_sq = dynamic_thresh * dynamic_thresh
+        
+        if perp_dist_sq < thresh_sq:
             occluder_count += 1
             if occluder_count >= min_occluders:
                 return True
@@ -132,7 +161,7 @@ def _compute_occlusion_ratio(
     points,             # 所有点云 (N, 3)
     box_indices,        # 框内点索引
     sensor,             # 传感器位置
-    occlusion_thresh,   # 遮挡阈值
+    angle_thresh,       # 角度阈值（弧度）
     min_occluders,      # 最少遮挡点数
     max_check,          # 最大检测点数（降采样）
     max_other           # 最大其他点数（降采样）
@@ -190,7 +219,7 @@ def _compute_occlusion_ratio(
         pt_idx = box_indices[i]
         target = points[pt_idx]
         
-        if _check_ray_occlusion(target, sensor, other_points, occlusion_thresh, min_occluders):
+        if _check_ray_occlusion(target, sensor, other_points, angle_thresh, min_occluders):
             occluded += 1
         checked += 1
     
@@ -205,7 +234,7 @@ def compute_visibility(
     bbox: Union[np.ndarray, List],
     points: np.ndarray,
     sensor_origin: Optional[np.ndarray] = None,
-    occlusion_thresh: float = 0.2,
+    angle_thresh_deg: float = 0.5,
     min_occluders: int = 3,
     max_check_points: int = 50,
     max_other_points: int = 5000
@@ -216,11 +245,17 @@ def compute_visibility(
     对框内的每个点，检测从传感器到该点的射线是否被其他点云遮挡。
     可见性 = 1 - 遮挡比例
     
+    【射线宽度】
+    使用角度阈值，射线宽度随距离自适应：
+        宽度 = 距离 × tan(angle_thresh)
+        10m处: ~0.17m
+        50m处: ~0.87m
+    
     Args:
         bbox: [cx, cy, cz, length, width, height, yaw]
         points: (N, 3) 点云
         sensor_origin: (3,) 传感器位置，默认[0,0,0]
-        occlusion_thresh: 遮挡判定距离阈值（米）
+        angle_thresh_deg: 射线角度阈值（度），默认1°
         min_occluders: 最少遮挡点数（避免单点误判）
         max_check_points: 最大检测点数（框内点降采样）
         max_other_points: 最大其他点数（场景点降采样）
@@ -235,6 +270,9 @@ def compute_visibility(
     bbox = np.asarray(bbox, dtype=np.float64)
     points = np.ascontiguousarray(points[:,:3], dtype=np.float64)
     sensor = np.asarray(sensor_origin, dtype=np.float64)
+    
+    # 角度转弧度
+    angle_thresh = np.deg2rad(angle_thresh_deg)
     
     cx, cy, cz = bbox[0], bbox[1], bbox[2]
     l, w, h, yaw = bbox[3], bbox[4], bbox[5], bbox[6]
@@ -260,7 +298,7 @@ def compute_visibility(
     # 计算遮挡
     occ_ratio, n_checked, n_occluded = _compute_occlusion_ratio(
         points, box_indices, sensor,
-        occlusion_thresh, min_occluders, max_check_points, max_other_points
+        angle_thresh, min_occluders, max_check_points, max_other_points
     )
     
     visibility = 1.0 - occ_ratio
