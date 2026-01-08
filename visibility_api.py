@@ -360,26 +360,31 @@ def _parse_bbox_dict(bbox_dict: Dict) -> Tuple[np.ndarray, float, float, float, 
     输入格式:
     {
         'position': {'x': ..., 'y': ..., 'z': ...},
-        'size': [w, h, l],  # size[0]=宽, size[1]=高, size[2]=长
-        'orientation': {'phi': ..., 'theta': ..., 'psi': ...},
+        'size': [w, h, l],  # size[0]=宽, size[1]=高, size[2]=长 (可能是字符串)
+        'orientation': {'phi': ..., 'theta': ..., 'psi': ...},  # 可能是字符串
         ...
     }
     
     返回: center, length, width, height, phi, theta, psi
     """
-    # 位置
+    # 位置 (强制转float，兼容字符串)
     cx = float(bbox_dict['position']['x'])
     cy = float(bbox_dict['position']['y'])
     cz = float(bbox_dict['position']['z'])
     center = np.array([cx, cy, cz], dtype=np.float64)
     
-    # 尺寸 (注意您代码中的顺序)
+    # 尺寸 (注意您代码中的顺序，强制转float兼容字符串)
     # l, w, h = float(bbox['size'][2]), float(bbox['size'][0]), float(bbox['size'][1])
     length = float(bbox_dict['size'][2])  # 长
     width = float(bbox_dict['size'][0])   # 宽
     height = float(bbox_dict['size'][1])  # 高
     
-    # 旋转角
+    # 确保尺寸有效（至少0.1m）
+    length = max(length, 0.1)
+    width = max(width, 0.1)
+    height = max(height, 0.1)
+    
+    # 旋转角 (强制转float，兼容字符串)
     phi = float(bbox_dict['orientation']['phi'])      # Z轴 (yaw)
     theta = float(bbox_dict['orientation']['theta'])  # Y轴 (pitch)
     psi = float(bbox_dict['orientation']['psi'])      # X轴 (roll)
@@ -442,11 +447,24 @@ def compute_bbox_visibility(
     half_dims = np.array([length/2, width/2, height/2], dtype=np.float64)
     
     # 表面采样
-    samples, face_ids = _sample_visible_surfaces(
-        center, half_dims, R, sensor, total_samples, exclude_bottom
-    )
+    try:
+        samples, face_ids = _sample_visible_surfaces(
+            center, half_dims, R, sensor, total_samples, exclude_bottom
+        )
+    except Exception as e:
+        # 采样失败，返回默认值
+        return 0.0, {
+            'score': 0.0,
+            'n_samples': 0,
+            'n_blocked': 0,
+            'n_visible': 0,
+            'status': 'ERROR',
+            'face_visibility': {},
+            'n_visible_faces': 0,
+            'error': str(e)
+        }
     
-    n_samples = samples.shape[0]
+    n_samples = samples.shape[0] if samples is not None else 0
     if n_samples == 0:
         return 0.0, {
             'score': 0.0,

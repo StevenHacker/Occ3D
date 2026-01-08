@@ -201,10 +201,11 @@ def read_point_cloud(pcd_path):
 
 def transform_bbox_to_lidar(bbox, T_ego_to_lidar):
     """将bbox从ego坐标系转换到lidar坐标系"""
+    # 强制转float，兼容字符串类型
     point_homo = np.array([
-        bbox['position']['x'],
-        bbox['position']['y'],
-        bbox['position']['z'],
+        float(bbox['position']['x']),
+        float(bbox['position']['y']),
+        float(bbox['position']['z']),
         1.0
     ], dtype=np.float64)
     
@@ -216,6 +217,16 @@ def transform_bbox_to_lidar(bbox, T_ego_to_lidar):
         'y': float(point_lidar_homo[1]),
         'z': float(point_lidar_homo[2])
     }
+    
+    # 确保size和orientation也是数字类型
+    if 'size' in bbox_lidar:
+        bbox_lidar['size'] = [float(s) for s in bbox_lidar['size']]
+    
+    if 'orientation' in bbox_lidar:
+        bbox_lidar['orientation'] = {
+            k: float(v) for k, v in bbox_lidar['orientation'].items()
+        }
+    
     return bbox_lidar
 
 
