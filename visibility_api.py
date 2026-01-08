@@ -446,22 +446,65 @@ def compute_bbox_visibility(
     R = _rotation_matrix_zyx(phi, theta, psi)
     half_dims = np.array([length/2, width/2, height/2], dtype=np.float64)
     
+    # 检查输入数据有效性
+    def check_valid(name, arr):
+        if arr is None:
+            return f"{name} is None"
+        if not isinstance(arr, np.ndarray):
+            return f"{name} is not ndarray: {type(arr)}"
+        if np.any(np.isnan(arr)):
+            return f"{name} contains NaN: {arr}"
+        if np.any(np.isinf(arr)):
+            return f"{name} contains Inf: {arr}"
+        return None
+    
+    # 检查各项输入
+    errors = []
+    for name, arr in [('center', center), ('half_dims', half_dims), ('R', R), ('sensor', sensor)]:
+        err = check_valid(name, arr)
+        if err:
+            errors.append(err)
+    
+    # 检查尺寸是否有效
+    if np.any(half_dims <= 0):
+        errors.append(f"half_dims has non-positive values: {half_dims}")
+    
+    if errors:
+        return 0.0, {
+            'score': 0.0,
+            'n_samples': 0,
+            'n_blocked': 0,
+            'n_visible': 0,
+            'status': 'INVALID_INPUT',
+            'face_visibility': {},
+            'n_visible_faces': 0,
+            'errors': errors
+        }
+    
     # 表面采样
     try:
         samples, face_ids = _sample_visible_surfaces(
             center, half_dims, R, sensor, total_samples, exclude_bottom
         )
     except Exception as e:
-        # 采样失败，返回默认值
+        # 采样失败，返回详细错误信息
+        import traceback
         return 0.0, {
             'score': 0.0,
             'n_samples': 0,
             'n_blocked': 0,
             'n_visible': 0,
-            'status': 'ERROR',
+            'status': 'SAMPLE_ERROR',
             'face_visibility': {},
             'n_visible_faces': 0,
-            'error': str(e)
+            'error': str(e),
+            'traceback': traceback.format_exc(),
+            'debug_info': {
+                'center': center.tolist(),
+                'half_dims': half_dims.tolist(),
+                'R_shape': R.shape,
+                'sensor': sensor.tolist()
+            }
         }
     
     n_samples = samples.shape[0] if samples is not None else 0

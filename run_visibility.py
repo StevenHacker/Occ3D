@@ -345,9 +345,25 @@ def process_frame(
     
     if verbose:
         print(f"        完成! 耗时: {t1-t0:.1f}s")
+    
+    # 打印结果
     print(f"\n[{frame_name}] 可见性结果:")
+    error_count = 0
     for track_id, info in visibility_results.items():
-        print(f"  {track_id}: {info['score']:.0%} ({info['status']})")
+        status = info['status']
+        if status in ['ERROR', 'SAMPLE_ERROR', 'INVALID_INPUT']:
+            error_count += 1
+            if 'errors' in info:
+                print(f"  {track_id}: ❌ {status} - {info['errors']}")
+            elif 'error' in info:
+                print(f"  {track_id}: ❌ {status} - {info['error']}")
+            else:
+                print(f"  {track_id}: ❌ {status}")
+        else:
+            print(f"  {track_id}: {info['score']:.0%} ({status})")
+    
+    if error_count > 0:
+        print(f"  [警告] {error_count} 个bbox计算失败")
     
     # ========== 可视化 (可选) ==========
     if visualize and HAS_CV2 and HAS_VISUALIZER:
