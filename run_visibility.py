@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+# -*-coding:utf-8 -*-
+"""
+3D标注框可见性计算脚本
+======================
+
+【使用方法】
+python run_visibility.py --clip_path /path/to/clip --visualize
+
+【参数说明】
+--clip_path     : 数据clip路径
+--visualize     : 是否生成可视化图像
+--output_json   : 是否输出可见性结果JSON
+--style         : 可视化样式 (full/score/status/compact)
+
+【示例】
+# 仅计算可见性
+python run_visibility.py --clip_path /data/clip_001
+
+# 计算并可视化
+python run_visibility.py --clip_path /data/clip_001 --visualize
+
+# 输出JSON结果
+python run_visibility.py --clip_path /data/clip_001 --output_json
+"""
+
+import os
+import sys
+import argparse
+import json
+import glob
+import shutil
+import numpy as np
+from scipy.spatial.transform import Rotation as R
+from tqdm import tqdm
+
+# 导入可见性计算接口
+from visibility_api import (
+    compute_frame_visibility,
+    compute_bbox_visibility,
+    classify_visibility,
+    visualize_visibility,
+    HAS_VISUALIZER
+)
+
+# cv2 用于可视化
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+
+# pypcd 用于读取点云
+try:
+    from pypcd import pypcd
+    HAS_PYPCD = True
+except ImportError:
+    HAS_PYPCD = False
+    print("[警告] pypcd未安装，请安装: pip install pypcd")
+
+
+# ============================================================
+# 工具函数 (与您原代码兼容)
+# ============================================================
+
+def xyzquat2mat(xyzquat):
+    """四元数转变换矩阵"""
+    T = np.eye(4)
+    T[:3, :3] = R.from_quat(xyzquat[3:]).as_matrix()
+    T[:3, 3] = xyzquat[:3]
+    return T
+
+
+def build_ego_to_lidar_transform(translation, rotation):
+    """构建ego到lidar的变换矩阵"""
+    t = np.array(translation, dtype=np.float32)
+    rot = np.array(rotation, dtype=np.float32)
+    
+    T = np.eye(4)
+    T[:3, :3] = rot
+    T[:3, 3] = t
+    
+    T_inv = np.linalg.inv(T)
+    return T_inv
+
+
+def read_camera_param(params_json, camera_name):
+    """读取相机参数"""
+    with open(params_json, 'r', encoding='utf-8') as f:
+        json_info = json.load(f)
+        info = json_info['sensors']['Cameras']
+        for sensor in info:
+            if sensor['name'] == camera_name:
+                dist = np.array(sensor['intrinsic']['D'], dtype=np.float64)
+                mtx = np.array(sensor['intrinsic']['K'], dtype=np.float64)
+                quat = np.array(sensor['extrinsic']['to_lidar_main'], dtype=np.float64)
+                extr = xyzquat2mat(quat)
+                w = sensor['width']
+                h = sensor['height']
+                return dist, mtx, extr, w, h
+    return None, None, None, None, None
+
+
+def filter_origin_car(pts):
+    """过滤采集车周围的点"""
+    suv_length = 5.0
+    suv_width = 3.0
+    suv_height = 3.0
+    
+    car_x_min, car_x_max = -suv_length / 2, suv_length / 2
+    car_y_min, car_y_max = -suv_width / 2, suv_width / 2
+    car_z_min, car_z_max = -suv_height / 2, suv_height / 2
+    
+    car_mask = (
+        (pts[:, 0] >= car_x_min) & (pts[:, 0] <= car_x_max) &
+        (pts[:, 1] >= car_y_min) & (pts[:, 1] <= car_y_max) &
+        (pts[:, 2] >= car_z_min) & (pts[:, 2] <= car_z_max)
+    )
+    valid_mask = np.logical_not(car_mask)
+    return pts[valid_mask]
+
+
+def read_point_cloud(pcd_path):
+    """读取点云文件"""
+    if not HAS_PYPCD:
+        raise ImportError("需要pypcd库: pip install pypcd")
+    
+    pypcd.pcd_type_to_numpy_type[('I', 1)] = np.int8
+    pcd_obj = pypcd.PointCloud.from_path(pcd_path)
+    pcd_data = pcd_obj.pc_data
+    pcd_pts = np.column_stack([pcd_data['x'], pcd_data['y'], pcd_data['z']])
+    return pcd_pts
+
+
+def transform_bbox_to_lidar(bbox, T_ego_to_lidar):
+    """将bbox从ego坐标系转换到lidar坐标系"""
+    point_homo = np.array([
+        bbox['position']['x'],
+        bbox['position']['y'],
+        bbox['position']['z'],
+        1.0
+    ], dtype=np.float64)
+    
+    point_lidar_homo = np.dot(T_ego_to_lidar, point_homo)
+    
+    bbox_lidar = bbox.copy()
+    bbox_lidar['position'] = {
+        'x': float(point_lidar_homo[0]),
+        'y': float(point_lidar_homo[1]),
+        'z': float(point_lidar_homo[2])
+    }
+    return bbox_lidar
+
+
+# ============================================================
+# 主处理函数
+# ============================================================
+
+def process_frame(
+    label_json: str,
+    clip_path: str,
+    visualize: bool = False,
+    output_json: bool = False,
+    style: str = 'full'
+) -> dict:
+    """
+    处理单帧数据
+    
+    Args:
+        label_json: 标注JSON文件路径
+        clip_path: clip数据路径
+        visualize: 是否生成可视化图像
+        output_json: 是否返回详细结果
+        style: 可视化样式
+    
+    Returns:
+        帧的可见性结果
+    """
+    # 读取标注数据
+    with open(label_json, 'r', encoding='utf-8') as fp:
+        all_data = json.load(fp)
+    
+    # 路径
+    pcd_path = os.path.join(
+        os.path.dirname(clip_path),
+        all_data['frame_info']['lidar_object_info']['lidar_path']
+    )
+    params_json = os.path.join(clip_path, 'sensor_datas', 'info.json')
+    
+    # 读取点云
+    pcd_pts = read_point_cloud(pcd_path)
+    
+    # 获取3D标注
+    label_3D = all_data['frame_info']['lidar_object_info']['lidar_object_info']
+    
+    # 坐标转换
+    lidar2ego_translation = all_data['sensor_info']['lidar_info']['lidar_main']['lidar2ego_translation']
+    lidar2ego_rotation = all_data['sensor_info']['lidar_info']['lidar_main']['lidar2ego_rotation']
+    T_ego_to_lidar = build_ego_to_lidar_transform(lidar2ego_translation, lidar2ego_rotation)
+    T_ego_to_lidar = np.asarray(T_ego_to_lidar, dtype=np.float64)
+    
+    # 转换所有bbox到lidar坐标系
+    label_3d_lidar = []
+    for bbox in label_3D:
+        bbox_lidar = transform_bbox_to_lidar(bbox, T_ego_to_lidar)
+        label_3d_lidar.append(bbox_lidar)
+    
+    # 过滤采集车
+    filter_pcd_pts = filter_origin_car(pcd_pts)
+    
+    # ========== 计算可见性 ==========
+    visibility_results = compute_frame_visibility(label_3d_lidar, filter_pcd_pts)
+    
+    # 打印结果
+    frame_name = os.path.basename(label_json)
+    print(f"\n[{frame_name}] 可见性结果:")
+    for track_id, info in visibility_results.items():
+        print(f"  {track_id}: {info['score']:.0%} ({info['status']})")
+    
+    # ========== 可视化 (可选) ==========
+    if visualize and HAS_CV2 and HAS_VISUALIZER:
+        camera_list = all_data['frame_info']['camera_object_info'].keys()
+        
+        # 创建可视化输出目录
+        vis_path = os.path.join(clip_path, 'visibility_vis')
+        os.makedirs(vis_path, exist_ok=True)
+        
+        for camera in camera_list:
+            # 读取相机参数
+            distortion, intrinsic, extrinsic, width, height = \
+                read_camera_param(params_json, camera)
+            
+            if intrinsic is None:
+                continue
+            
+            # 读取图像
+            camera_image_path = os.path.join(
+                clip_path,
+                all_data['sensor_info']['camera_info'][camera]['path']
+            )
+            
+            if not os.path.exists(camera_image_path):
+                continue
+            
+            img = cv2.imread(camera_image_path)
+            if img is None:
+                continue
+            
+            # 绑制可见性
+            img = visualize_visibility(
+                img,
+                label_3d_lidar,
+                visibility_results,
+                extrinsic,
+                intrinsic,
+                distortion,
+                width,
+                height,
+                style=style,
+                draw_wireframe=True,
+                add_legend=True,
+                filter_camera=camera
+            )
+            
+            # 保存
+            output_name = os.path.basename(camera_image_path).replace('.jpg', '_vis.jpg')
+            camera_vis_path = os.path.join(vis_path, camera)
+            os.makedirs(camera_vis_path, exist_ok=True)
+            output_path = os.path.join(camera_vis_path, output_name)
+            cv2.imwrite(output_path, img)
+        
+        print(f"  可视化已保存到: {vis_path}")
+    
+    # 返回结果
+    frame_result = {
+        'frame': frame_name,
+        'visibility': visibility_results
+    }
+    
+    return frame_result
+
+
+def process_clip(
+    clip_path: str,
+    visualize: bool = False,
+    output_json: bool = False,
+    style: str = 'full',
+    max_frames: int = None
+) -> dict:
+    """
+    处理整个clip
+    
+    Args:
+        clip_path: clip数据路径
+        visualize: 是否生成可视化图像
+        output_json: 是否输出JSON结果
+        style: 可视化样式
+        max_frames: 最大处理帧数 (None表示全部)
+    
+    Returns:
+        所有帧的可见性结果
+    """
+    # 获取所有标注文件
+    label_path = os.path.join(clip_path, 'labels')
+    label_list = sorted(glob.glob(os.path.join(label_path, "*.json")))
+    
+    if len(label_list) == 0:
+        print(f"[错误] 未找到标注文件: {label_path}")
+        return {}
+    
+    print(f"找到 {len(label_list)} 帧标注")
+    
+    # 限制帧数
+    if max_frames is not None:
+        label_list = label_list[:max_frames]
+    
+    # 清理旧的可视化目录
+    if visualize:
+        vis_path = os.path.join(clip_path, 'visibility_vis')
+        if os.path.exists(vis_path):
+            shutil.rmtree(vis_path)
+    
+    # 处理每一帧
+    all_results = {}
+    for label_json in tqdm(label_list, desc="处理帧"):
+        try:
+            frame_result = process_frame(
+                label_json, clip_path, visualize, output_json, style
+            )
+            all_results[frame_result['frame']] = frame_result['visibility']
+        except Exception as e:
+            print(f"[错误] 处理 {label_json} 失败: {e}")
+            continue
+    
+    # 保存JSON结果
+    if output_json:
+        output_path = os.path.join(clip_path, 'visibility_results.json')
+        with open(output_path, 'w', encoding='utf-8') as f:
+            # 转换为可序列化格式
+            serializable_results = {}
+            for frame, vis in all_results.items():
+                serializable_results[frame] = {
+                    track_id: {
+                        'score': info['score'],
+                        'status': info['status'],
+                        'n_samples': info['n_samples'],
+                        'n_blocked': info['n_blocked'],
+                        'n_visible': info['n_visible']
+                    }
+                    for track_id, info in vis.items()
+                }
+            json.dump(serializable_results, f, indent=2, ensure_ascii=False)
+        print(f"\n结果已保存到: {output_path}")
+    
+    # 统计
+    print("\n" + "=" * 50)
+    print("可见性统计")
+    print("=" * 50)
+    
+    status_counts = {'VISIBLE': 0, 'PARTIAL': 0, 'OCCLUDED': 0, 'BLOCKED': 0}
+    total = 0
+    
+    for frame, vis in all_results.items():
+        for track_id, info in vis.items():
+            status = info['status']
+            status_counts[status] = status_counts.get(status, 0) + 1
+            total += 1
+    
+    print(f"总目标数: {total}")
+    for status, count in status_counts.items():
+        pct = count / total * 100 if total > 0 else 0
+        print(f"  {status}: {count} ({pct:.1f}%)")
+    print("=" * 50)
+    
+    return all_results
+
+
+# ============================================================
+# 命令行接口
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='3D标注框可见性计算',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  # 仅计算可见性
+  python run_visibility.py --clip_path /data/clip_001
+  
+  # 计算并可视化
+  python run_visibility.py --clip_path /data/clip_001 --visualize
+  
+  # 输出JSON结果
+  python run_visibility.py --clip_path /data/clip_001 --output_json
+  
+  # 只处理前5帧
+  python run_visibility.py --clip_path /data/clip_001 --max_frames 5 --visualize
+        """
+    )
+    
+    parser.add_argument(
+        '--clip_path', type=str, required=True,
+        help='数据clip路径'
+    )
+    parser.add_argument(
+        '--visualize', action='store_true',
+        help='是否生成可视化图像'
+    )
+    parser.add_argument(
+        '--output_json', action='store_true',
+        help='是否输出可见性结果JSON'
+    )
+    parser.add_argument(
+        '--style', type=str, default='full',
+        choices=['full', 'score', 'status', 'compact'],
+        help='可视化样式 (default: full)'
+    )
+    parser.add_argument(
+        '--max_frames', type=int, default=None,
+        help='最大处理帧数'
+    )
+    
+    args = parser.parse_args()
+    
+    # 检查路径
+    if not os.path.exists(args.clip_path):
+        print(f"[错误] 路径不存在: {args.clip_path}")
+        sys.exit(1)
+    
+    # 检查依赖
+    if args.visualize and not HAS_CV2:
+        print("[警告] cv2未安装，无法进行可视化")
+        args.visualize = False
+    
+    # 处理
+    print(f"处理clip: {args.clip_path}")
+    print(f"可视化: {args.visualize}")
+    print(f"输出JSON: {args.output_json}")
+    
+    results = process_clip(
+        args.clip_path,
+        visualize=args.visualize,
+        output_json=args.output_json,
+        style=args.style,
+        max_frames=args.max_frames
+    )
+
+
+if __name__ == '__main__':
+    main()

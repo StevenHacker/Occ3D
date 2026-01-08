@@ -5,22 +5,23 @@
 =====================
 
 【功能】
-计算3D标注框在点云中的可见性（基于表面采样+射线遮挡检测）
+- 计算3D标注框在点云中的可见性（基于表面采样+射线遮挡检测）
+- 可视化可见性结果到图像
 
 【使用方法】
 ```python
-from visibility_api import compute_frame_visibility
+from visibility_api import compute_frame_visibility, visualize_visibility
 
-# 计算单帧所有bbox的可见性
+# 1. 计算可见性
 results = compute_frame_visibility(label_3d_list, pcd_pts)
 
-# 结果格式
-for track_id, info in results.items():
-    print(f"ID={track_id}, 可见性={info['score']:.2f}, 状态={info['status']}")
+# 2. 可视化（可选）
+img = visualize_visibility(img, label_3d_list, results, extrinsic, intrinsic)
+cv2.imwrite('output.jpg', img)
 ```
 
 【数据格式】
-bbox格式 (与您的代码兼容):
+bbox格式:
 {
     'position': {'x': float, 'y': float, 'z': float},
     'size': [w, h, l],  # size[0]=宽, size[1]=高, size[2]=长
@@ -34,6 +35,19 @@ bbox格式 (与您的代码兼容):
 
 import numpy as np
 from typing import Dict, List, Tuple, Union, Optional
+
+# 导入可视化工具
+try:
+    import cv2
+    from visibility_visualizer import (
+        VisibilityVisualizer,
+        visualize_frame_visibility,
+        project_bboxes_to_image,
+        print_visibility_summary
+    )
+    HAS_VISUALIZER = True
+except ImportError:
+    HAS_VISUALIZER = False
 
 # ============================================================
 # Numba JIT 编译支持（可选，用于加速）
@@ -578,6 +592,87 @@ def classify_visibility(score: float) -> str:
     if score > 0.05:
         return "OCCLUDED"
     return "BLOCKED"
+
+
+# ============================================================
+# 可视化接口
+# ============================================================
+
+def visualize_visibility(
+    img: np.ndarray,
+    label_3d_list: List[Dict],
+    visibility_results: Dict[str, Dict],
+    extrinsic: np.ndarray,
+    intrinsic: np.ndarray,
+    distortion: Optional[np.ndarray] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    style: str = 'full',
+    draw_wireframe: bool = True,
+    add_legend: bool = True,
+    filter_camera: Optional[str] = None
+) -> np.ndarray:
+    """
+    在图像上可视化可见性结果
+    
+    Args:
+        img: 输入图像 (BGR格式)
+        label_3d_list: 3D标注框列表
+        visibility_results: 可见性计算结果
+        extrinsic: (4, 4) 外参矩阵
+        intrinsic: (3, 3) 内参矩阵
+        distortion: 畸变系数
+        width: 图像宽度
+        height: 图像高度
+        style: 标签样式 ('full', 'score', 'status', 'compact')
+        draw_wireframe: 是否绘制3D框线框
+        add_legend: 是否添加图例
+        filter_camera: 过滤相机名称
+    
+    Returns:
+        绑制后的图像
+    """
+    if not HAS_VISUALIZER:
+        raise ImportError("可视化功能需要cv2和visibility_visualizer模块")
+    
+    visualizer = VisibilityVisualizer()
+    
+    img = visualizer.draw_visibility_on_image(
+        img, label_3d_list, visibility_results,
+        extrinsic, intrinsic, distortion,
+        width, height, style, draw_wireframe, filter_camera
+    )
+    
+    if add_legend:
+        img = visualizer.create_visibility_legend(img, position='top-left')
+    
+    return img
+
+
+def get_projections(
+    label_3d_list: List[Dict],
+    visibility_results: Dict[str, Dict],
+    extrinsic: np.ndarray,
+    intrinsic: np.ndarray,
+    distortion: Optional[np.ndarray] = None,
+    width: int = 1920,
+    height: int = 1080,
+    filter_camera: Optional[str] = None
+) -> List[Dict]:
+    """
+    获取3D框投影到图像的坐标（不绑制）
+    
+    Returns:
+        投影结果列表
+    """
+    if not HAS_VISUALIZER:
+        raise ImportError("需要visibility_visualizer模块")
+    
+    return project_bboxes_to_image(
+        label_3d_list, visibility_results,
+        extrinsic, intrinsic, distortion,
+        width, height, filter_camera
+    )
 
 
 # ============================================================
