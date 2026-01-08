@@ -161,7 +161,8 @@ def process_frame(
     clip_path: str,
     visualize: bool = False,
     output_json: bool = False,
-    style: str = 'full'
+    style: str = 'full',
+    verbose: bool = False
 ) -> dict:
     """
     处理单帧数据
@@ -172,10 +173,16 @@ def process_frame(
         visualize: 是否生成可视化图像
         output_json: 是否返回详细结果
         style: 可视化样式
+        verbose: 是否打印详细信息
     
     Returns:
         帧的可见性结果
     """
+    frame_name = os.path.basename(label_json)
+    
+    if verbose:
+        print(f"  [1/4] 读取标注: {frame_name}")
+    
     # 读取标注数据
     with open(label_json, 'r', encoding='utf-8') as fp:
         all_data = json.load(fp)
@@ -188,10 +195,16 @@ def process_frame(
     params_json = os.path.join(clip_path, 'sensor_datas', 'info.json')
     
     # 读取点云
+    if verbose:
+        print(f"  [2/4] 读取点云: {os.path.basename(pcd_path)}")
     pcd_pts = read_point_cloud(pcd_path)
+    if verbose:
+        print(f"        点云数量: {len(pcd_pts)}")
     
     # 获取3D标注
     label_3D = all_data['frame_info']['lidar_object_info']['lidar_object_info']
+    if verbose:
+        print(f"        标注框数量: {len(label_3D)}")
     
     # 坐标转换
     lidar2ego_translation = all_data['sensor_info']['lidar_info']['lidar_main']['lidar2ego_translation']
@@ -209,16 +222,24 @@ def process_frame(
     filter_pcd_pts = filter_origin_car(pcd_pts)
     
     # ========== 计算可见性 ==========
-    visibility_results = compute_frame_visibility(label_3d_lidar, filter_pcd_pts)
+    if verbose:
+        print(f"  [3/4] 计算可见性 (首次运行需编译，请稀等30-60秒)...")
     
-    # 打印结果
-    frame_name = os.path.basename(label_json)
+    import time
+    t0 = time.time()
+    visibility_results = compute_frame_visibility(label_3d_lidar, filter_pcd_pts)
+    t1 = time.time()
+    
+    if verbose:
+        print(f"        完成! 耗时: {t1-t0:.1f}s")
     print(f"\n[{frame_name}] 可见性结果:")
     for track_id, info in visibility_results.items():
         print(f"  {track_id}: {info['score']:.0%} ({info['status']})")
     
     # ========== 可视化 (可选) ==========
     if visualize and HAS_CV2 and HAS_VISUALIZER:
+        if verbose:
+            print(f"  [4/4] 生成可视化...")
         camera_list = all_data['frame_info']['camera_object_info'].keys()
         
         # 创建可视化输出目录
@@ -322,14 +343,22 @@ def process_clip(
     
     # 处理每一帧
     all_results = {}
+    
+    # 第一帧详细打印（Numba编译）
+    first_frame = True
+    
     for label_json in tqdm(label_list, desc="处理帧"):
         try:
+            verbose = first_frame  # 第一帧显示详细信息
             frame_result = process_frame(
-                label_json, clip_path, visualize, output_json, style
+                label_json, clip_path, visualize, output_json, style, verbose
             )
             all_results[frame_result['frame']] = frame_result['visibility']
+            first_frame = False
         except Exception as e:
             print(f"[错误] 处理 {label_json} 失败: {e}")
+            import traceback
+            traceback.print_exc()
             continue
     
     # 保存JSON结果
