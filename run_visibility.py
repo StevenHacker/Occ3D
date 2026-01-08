@@ -200,7 +200,13 @@ def read_point_cloud(pcd_path):
 
 
 def transform_bbox_to_lidar(bbox, T_ego_to_lidar):
-    """将bbox从ego坐标系转换到lidar坐标系"""
+    """
+    将bbox从ego坐标系转换到lidar坐标系
+    
+    注意: 如果T_ego_to_lidar包含旋转，orientation也需要转换
+    """
+    from scipy.spatial.transform import Rotation as ROT
+    
     # 强制转float，兼容字符串类型
     point_homo = np.array([
         float(bbox['position']['x']),
@@ -218,14 +224,43 @@ def transform_bbox_to_lidar(bbox, T_ego_to_lidar):
         'z': float(point_lidar_homo[2])
     }
     
-    # 确保size和orientation也是数字类型
+    # 确保size是数字类型
     if 'size' in bbox_lidar:
         bbox_lidar['size'] = [float(s) for s in bbox_lidar['size']]
     
+    # 转换orientation (如果变换矩阵包含旋转)
     if 'orientation' in bbox_lidar:
-        bbox_lidar['orientation'] = {
-            k: float(v) for k, v in bbox_lidar['orientation'].items()
-        }
+        # 提取旋转部分
+        R_ego_to_lidar = T_ego_to_lidar[:3, :3]
+        
+        # 检查是否有旋转（不是单位矩阵）
+        is_identity = np.allclose(R_ego_to_lidar, np.eye(3), atol=1e-6)
+        
+        if not is_identity:
+            # 原始orientation
+            phi = float(bbox['orientation']['phi'])
+            theta = float(bbox['orientation']['theta'])
+            psi = float(bbox['orientation']['psi'])
+            
+            # 原始旋转矩阵 (ego坐标系)
+            R_bbox_ego = ROT.from_euler('ZYX', [phi, theta, psi]).as_matrix()
+            
+            # 转换到lidar坐标系: R_bbox_lidar = R_ego_to_lidar @ R_bbox_ego
+            R_bbox_lidar = R_ego_to_lidar @ R_bbox_ego
+            
+            # 转回euler角
+            euler_lidar = ROT.from_matrix(R_bbox_lidar).as_euler('ZYX')
+            
+            bbox_lidar['orientation'] = {
+                'phi': float(euler_lidar[0]),
+                'theta': float(euler_lidar[1]),
+                'psi': float(euler_lidar[2])
+            }
+        else:
+            # 只转换为数字类型
+            bbox_lidar['orientation'] = {
+                k: float(v) for k, v in bbox_lidar['orientation'].items()
+            }
     
     return bbox_lidar
 

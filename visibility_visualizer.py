@@ -191,12 +191,17 @@ class VisibilityVisualizer:
         """
         将3D标注框8个角点投影到图像
         
+        【坐标系约定】(与用户原代码一致)
+        - l(长度)方向: -l是前(车头), +l是后(车尾)
+        - w(宽度)方向: -w是左, +w是右
+        - h(高度)方向: -h是下, +h是上
+        
         Returns:
             corners_2d: 投影后的角点列表（仅包含在图像内的点）
         """
         from scipy.spatial.transform import Rotation as R
         
-        # 解析bbox
+        # 解析bbox (强制转float，兼容字符串)
         cx = float(bbox_dict['position']['x'])
         cy = float(bbox_dict['position']['y'])
         cz = float(bbox_dict['position']['z'])
@@ -209,24 +214,26 @@ class VisibilityVisualizer:
         theta = float(bbox_dict['orientation']['theta'])
         psi = float(bbox_dict['orientation']['psi'])
         
-        # 局部坐标系下的8个角点
+        # 局部坐标系下的8个角点 (与用户原代码get_box_point一致)
+        # 坐标系: -l=前, +l=后, -w=左, +w=右, -h=下, +h=上
         half_l, half_w, half_h = l/2, w/2, h/2
         corners_local = np.array([
-            [-half_l, -half_w, -half_h],
-            [-half_l, -half_w,  half_h],
-            [-half_l,  half_w, -half_h],
-            [-half_l,  half_w,  half_h],
-            [ half_l, -half_w, -half_h],
-            [ half_l, -half_w,  half_h],
-            [ half_l,  half_w, -half_h],
-            [ half_l,  half_w,  half_h],
+            [-half_l, -half_w, -half_h],  # 左前下
+            [-half_l, -half_w,  half_h],  # 左前上
+            [-half_l,  half_w, -half_h],  # 右前下
+            [-half_l,  half_w,  half_h],  # 右前上
+            [ half_l, -half_w, -half_h],  # 左后下
+            [ half_l, -half_w,  half_h],  # 左后上
+            [ half_l,  half_w, -half_h],  # 右后下
+            [ half_l,  half_w,  half_h],  # 右后上
         ])
         
-        # 旋转矩阵
+        # 旋转矩阵 (ZYX顺序，与用户原代码一致)
         rotation = R.from_euler('ZYX', [phi, theta, psi])
         rot_matrix = rotation.as_matrix()
         
-        # 转换到世界坐标系
+        # 转换到世界坐标系: world = R @ local + center
+        # 对于(N,3)的点矩阵，等价于 local @ R^T + center
         corners_world = np.dot(corners_local, rot_matrix.T) + np.array([cx, cy, cz])
         
         # 投影到图像
