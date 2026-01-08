@@ -56,7 +56,7 @@ try:
     HAS_PYPCD = True
 except ImportError:
     HAS_PYPCD = False
-    print("[警告] pypcd未安装，请安装: pip install pypcd")
+    print("[提示] pypcd未安装，将使用备用方法读取pcd文件")
 
 
 # ============================================================
@@ -120,16 +120,83 @@ def filter_origin_car(pts):
     return pts[valid_mask]
 
 
+def read_point_cloud_raw(pcd_path):
+    """
+    纯Python读取PCD文件（备用方法，不依赖pypcd）
+    支持ascii和binary格式
+    """
+    with open(pcd_path, 'rb') as f:
+        # 读取头部
+        header = {}
+        while True:
+            line = f.readline().decode('utf-8', errors='ignore').strip()
+            if line.startswith('DATA'):
+                data_type = line.split()[-1]
+                break
+            if ' ' in line:
+                key, value = line.split(' ', 1)
+                header[key] = value
+        
+        # 获取点数和字段
+        num_points = int(header.get('POINTS', 0))
+        fields = header.get('FIELDS', 'x y z').split()
+        
+        # 找到xyz的索引
+        try:
+            x_idx = fields.index('x')
+            y_idx = fields.index('y')
+            z_idx = fields.index('z')
+        except ValueError:
+            x_idx, y_idx, z_idx = 0, 1, 2
+        
+        if data_type == 'ascii':
+            # ASCII格式
+            points = []
+            for _ in range(num_points):
+                line = f.readline().decode('utf-8', errors='ignore').strip()
+                if line:
+                    values = line.split()
+                    if len(values) > max(x_idx, y_idx, z_idx):
+                        x = float(values[x_idx])
+                        y = float(values[y_idx])
+                        z = float(values[z_idx])
+                        points.append([x, y, z])
+            return np.array(points, dtype=np.float64)
+        
+        else:
+            # Binary格式
+            sizes = [int(s) for s in header.get('SIZE', '4 4 4').split()]
+            types = header.get('TYPE', 'F F F').split()
+            
+            # 构建dtype
+            dtype_map = {'F': 'f', 'I': 'i', 'U': 'I'}
+            dtype_list = []
+            for i, (field, size, typ) in enumerate(zip(fields, sizes, types)):
+                np_type = dtype_map.get(typ, 'f') + str(size)
+                dtype_list.append((field, np_type))
+            
+            dt = np.dtype(dtype_list)
+            data = np.frombuffer(f.read(), dtype=dt, count=num_points)
+            
+            points = np.column_stack([data['x'], data['y'], data['z']])
+            return points.astype(np.float64)
+
+
 def read_point_cloud(pcd_path):
-    """读取点云文件"""
-    if not HAS_PYPCD:
-        raise ImportError("需要pypcd库: pip install pypcd")
+    """读取点云文件（自动选择方法）"""
+    # 优先使用pypcd（如果可用且稳定）
+    if HAS_PYPCD:
+        try:
+            pypcd.pcd_type_to_numpy_type[('I', 1)] = np.int8
+            pcd_obj = pypcd.PointCloud.from_path(pcd_path)
+            pcd_data = pcd_obj.pc_data
+            pcd_pts = np.column_stack([pcd_data['x'], pcd_data['y'], pcd_data['z']])
+            return pcd_pts
+        except Exception as e:
+            print(f"[警告] pypcd读取失败，使用备用方法: {e}")
     
-    pypcd.pcd_type_to_numpy_type[('I', 1)] = np.int8
-    pcd_obj = pypcd.PointCloud.from_path(pcd_path)
-    pcd_data = pcd_obj.pc_data
-    pcd_pts = np.column_stack([pcd_data['x'], pcd_data['y'], pcd_data['z']])
-    return pcd_pts
+    # 备用方法：纯Python解析
+    return read_point_cloud_raw(pcd_path)
 
 
 def transform_bbox_to_lidar(bbox, T_ego_to_lidar):
