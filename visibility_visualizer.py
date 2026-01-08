@@ -20,11 +20,36 @@ img = visualizer.draw_visibility_on_image(
 )
 cv2.imwrite('output.jpg', img)
 ```
+
+【依赖安装】
+如果遇到cv2导入错误，请尝试：
+pip uninstall opencv-python opencv-python-headless opencv-contrib-python -y
+pip install opencv-python-headless==4.5.5.64
 """
 
 import numpy as np
-import cv2
 from typing import Dict, List, Tuple, Optional, Union
+
+# cv2 可选导入
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError as e:
+    HAS_CV2 = False
+    CV2_ERROR = str(e)
+    print(f"[警告] OpenCV导入失败: {e}")
+    print("[提示] 请尝试: pip install opencv-python-headless==4.5.5.64")
+
+
+def _check_cv2():
+    """检查cv2是否可用"""
+    if not HAS_CV2:
+        raise ImportError(
+            f"OpenCV (cv2) 导入失败: {CV2_ERROR}\n"
+            "请尝试以下命令修复:\n"
+            "  pip uninstall opencv-python opencv-python-headless opencv-contrib-python -y\n"
+            "  pip install opencv-python-headless==4.5.5.64"
+        )
 
 
 class VisibilityVisualizer:
@@ -58,7 +83,10 @@ class VisibilityVisualizer:
         """
         self.font_scale = font_scale
         self.thickness = thickness
-        self.font = cv2.FONT_HERSHEY_SIMPLEX
+        if HAS_CV2:
+            self.font = cv2.FONT_HERSHEY_SIMPLEX
+        else:
+            self.font = None
     
     def project_point_to_image(
         self,
@@ -71,6 +99,8 @@ class VisibilityVisualizer:
     ) -> Tuple[Optional[Tuple[int, int]], float]:
         """
         将3D点投影到图像平面
+        
+        【注意】此函数不依赖cv2，可以单独使用
         
         Args:
             point_3d: (3,) 3D点坐标 (lidar坐标系)
@@ -96,9 +126,8 @@ class VisibilityVisualizer:
             return None, depth
         
         # 投影到图像平面
-        if distortion is not None and len(distortion) > 0:
+        if HAS_CV2 and distortion is not None and len(distortion) > 0 and np.any(distortion != 0):
             # 使用OpenCV的投影函数处理畸变
-            point_cam_cv = point_cam.reshape(1, 1, 3)
             rvec = np.zeros(3)
             tvec = np.zeros(3)
             
@@ -110,7 +139,7 @@ class VisibilityVisualizer:
             )
             u, v = projected[0, 0]
         else:
-            # 无畸变，直接投影
+            # 无畸变或无cv2，直接投影 (针孔模型)
             point_norm = point_cam[:2] / point_cam[2]
             u = intrinsic[0, 0] * point_norm[0] + intrinsic[0, 2]
             v = intrinsic[1, 1] * point_norm[1] + intrinsic[1, 2]
@@ -238,6 +267,8 @@ class VisibilityVisualizer:
         Returns:
             绘制后的图像
         """
+        _check_cv2()
+        
         color = self.STATUS_COLORS.get(status, self.STATUS_COLORS['UNKNOWN'])
         u, v = position
         
@@ -310,6 +341,8 @@ class VisibilityVisualizer:
         Returns:
             绘制后的图像
         """
+        _check_cv2()
+        
         if len(corners_2d) < 2:
             return img
         
@@ -355,6 +388,8 @@ class VisibilityVisualizer:
         Returns:
             绘制后的图像
         """
+        _check_cv2()
+        
         if width is None:
             width = img.shape[1]
         if height is None:
@@ -420,6 +455,8 @@ class VisibilityVisualizer:
         Returns:
             添加图例后的图像
         """
+        _check_cv2()
+        
         img = img.copy()
         
         legend_items = [
@@ -472,7 +509,126 @@ class VisibilityVisualizer:
 
 
 # ============================================================
-# 便捷函数
+# 不依赖cv2的纯投影功能
+# ============================================================
+
+def project_bboxes_to_image(
+    label_3d_list: List[Dict],
+    visibility_results: Dict[str, Dict],
+    extrinsic: np.ndarray,
+    intrinsic: np.ndarray,
+    distortion: Optional[np.ndarray] = None,
+    width: int = 1920,
+    height: int = 1080,
+    filter_camera: Optional[str] = None
+) -> List[Dict]:
+    """
+    将3D标注框投影到图像平面（不依赖cv2）
+    
+    【用途】获取投影坐标后，可用任意方式绑定（PIL、matplotlib等）
+    
+    Args:
+        label_3d_list: 3D标注框列表
+        visibility_results: 可见性结果
+        extrinsic: 外参矩阵
+        intrinsic: 内参矩阵
+        distortion: 畸变系数
+        width: 图像宽度
+        height: 图像高度
+        filter_camera: 过滤相机
+    
+    Returns:
+        投影结果列表:
+        [
+            {
+                'track_id': 'xxx',
+                'pixel': (u, v),        # 中心点像素坐标
+                'depth': 15.3,          # 深度
+                'score': 0.85,          # 可见性分数
+                'status': 'VISIBLE',    # 状态
+                'in_image': True        # 是否在图像内
+            },
+            ...
+        ]
+    """
+    visualizer = VisibilityVisualizer()
+    results = []
+    
+    for bbox_dict in label_3d_list:
+        track_id = str(bbox_dict.get('track_id', 'unknown'))
+        
+        # 过滤相机
+        if filter_camera is not None:
+            camera_ids = bbox_dict.get('camera_ids', [])
+            if filter_camera not in camera_ids:
+                continue
+        
+        # 获取可见性
+        if track_id in visibility_results:
+            info = visibility_results[track_id]
+            score = info.get('score', 0)
+            status = info.get('status', 'UNKNOWN')
+        else:
+            score = 0
+            status = 'UNKNOWN'
+        
+        # 投影
+        pixel, depth = visualizer.project_bbox_center(
+            bbox_dict, extrinsic, intrinsic, distortion, width, height
+        )
+        
+        results.append({
+            'track_id': track_id,
+            'pixel': pixel,
+            'depth': depth,
+            'score': score,
+            'status': status,
+            'in_image': pixel is not None
+        })
+    
+    return results
+
+
+def print_visibility_summary(
+    label_3d_list: List[Dict],
+    visibility_results: Dict[str, Dict]
+) -> None:
+    """
+    打印可见性统计摘要（不依赖cv2）
+    
+    Args:
+        label_3d_list: 3D标注框列表
+        visibility_results: 可见性结果
+    """
+    print("\n" + "=" * 50)
+    print("可见性统计摘要")
+    print("=" * 50)
+    
+    status_counts = {'VISIBLE': 0, 'PARTIAL': 0, 'OCCLUDED': 0, 'BLOCKED': 0, 'UNKNOWN': 0}
+    
+    for bbox_dict in label_3d_list:
+        track_id = str(bbox_dict.get('track_id', 'unknown'))
+        if track_id in visibility_results:
+            info = visibility_results[track_id]
+            status = info.get('status', 'UNKNOWN')
+            score = info.get('score', 0)
+            status_counts[status] = status_counts.get(status, 0) + 1
+            print(f"  {track_id}: {score:.0%} ({status})")
+        else:
+            status_counts['UNKNOWN'] += 1
+            print(f"  {track_id}: 未计算")
+    
+    print("-" * 50)
+    print(f"总计: {len(label_3d_list)} 个目标")
+    print(f"  可见(VISIBLE):   {status_counts['VISIBLE']}")
+    print(f"  部分(PARTIAL):   {status_counts['PARTIAL']}")
+    print(f"  遮挡(OCCLUDED):  {status_counts['OCCLUDED']}")
+    print(f"  不可见(BLOCKED): {status_counts['BLOCKED']}")
+    print("=" * 50 + "\n")
+
+
+# ============================================================
+# 便捷函数 (需要cv2)
 # ============================================================
 
 def visualize_frame_visibility(
@@ -586,10 +742,6 @@ if __name__ == '__main__':
     # 创建模拟数据
     np.random.seed(42)
     
-    # 模拟图像
-    img = np.zeros((1080, 1920, 3), dtype=np.uint8)
-    img[:] = (50, 50, 50)  # 深灰色背景
-    
     # 模拟相机参数
     intrinsic = np.array([
         [1000, 0, 960],
@@ -644,22 +796,55 @@ if __name__ == '__main__':
         '004': {'score': 0.02, 'status': 'BLOCKED'},
     }
     
-    # 可视化
-    visualizer = VisibilityVisualizer()
+    # ========== 测试1: 不依赖cv2的投影功能 ==========
+    print("\n【测试1】纯投影功能 (不依赖cv2)")
+    print("-" * 40)
     
-    img = visualizer.draw_visibility_on_image(
-        img, label_3d_list, visibility_results,
+    projections = project_bboxes_to_image(
+        label_3d_list, visibility_results,
         extrinsic, intrinsic, distortion,
-        style='full',
-        draw_wireframe=True
+        width=1920, height=1080
     )
     
-    img = visualizer.create_visibility_legend(img, position='top-left')
+    for proj in projections:
+        if proj['in_image']:
+            print(f"  {proj['track_id']}: 像素({proj['pixel'][0]}, {proj['pixel'][1]}), "
+                  f"深度={proj['depth']:.1f}m, 可见性={proj['score']:.0%} ({proj['status']})")
+        else:
+            print(f"  {proj['track_id']}: 不在图像内")
     
-    # 保存
-    output_path = '/workspace/visibility_demo.jpg'
-    cv2.imwrite(output_path, img)
-    print(f"\n演示图像已保存到: {output_path}")
+    # ========== 测试2: 打印统计摘要 ==========
+    print_visibility_summary(label_3d_list, visibility_results)
+    
+    # ========== 测试3: cv2可视化 (如果可用) ==========
+    if HAS_CV2:
+        print("\n【测试2】cv2可视化")
+        print("-" * 40)
+        
+        # 模拟图像
+        img = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        img[:] = (50, 50, 50)  # 深灰色背景
+        
+        visualizer = VisibilityVisualizer()
+        
+        img = visualizer.draw_visibility_on_image(
+            img, label_3d_list, visibility_results,
+            extrinsic, intrinsic, distortion,
+            style='full',
+            draw_wireframe=True
+        )
+        
+        img = visualizer.create_visibility_legend(img, position='top-left')
+        
+        # 保存
+        output_path = '/workspace/visibility_demo.jpg'
+        cv2.imwrite(output_path, img)
+        print(f"演示图像已保存到: {output_path}")
+    else:
+        print("\n【测试2】cv2可视化 - 跳过 (cv2不可用)")
+        print("-" * 40)
+        print("提示: 安装cv2后可使用完整可视化功能")
+        print("  pip install opencv-python-headless==4.5.5.64")
     
     # 显示集成示例
     print("\n" + "=" * 60)
