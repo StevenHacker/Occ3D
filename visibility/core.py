@@ -53,6 +53,46 @@ def _parse_bbox(bbox_dict: Dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     return center, half_dims, R
 
 
+def _filter_points_outside_bbox(
+    points: np.ndarray,
+    center: np.ndarray,
+    half_dims: np.ndarray,
+    R: np.ndarray,
+    margin: float = 0.1
+) -> np.ndarray:
+    """
+    排除bbox内部的点
+    
+    框内的点是目标本身的点云，不应该参与遮挡计算
+    
+    Args:
+        points: (N, 3) 点云
+        center: (3,) bbox中心
+        half_dims: (3,) bbox半尺寸 [half_l, half_w, half_h]
+        R: (3, 3) bbox旋转矩阵
+        margin: 边界余量（米），稍微扩大排除范围
+    
+    Returns:
+        框外的点云
+    """
+    if len(points) == 0:
+        return points
+    
+    # 将点转换到bbox局部坐标系
+    local_pts = (R.T @ (points - center).T).T
+    
+    # 检查是否在框内（加上margin）
+    half_l, half_w, half_h = half_dims
+    in_box = (
+        (np.abs(local_pts[:, 0]) < half_l + margin) &
+        (np.abs(local_pts[:, 1]) < half_w + margin) &
+        (np.abs(local_pts[:, 2]) < half_h + margin)
+    )
+    
+    # 返回框外的点
+    return points[~in_box]
+
+
 def _filter_points_fast(
     points: np.ndarray,
     sensor: np.ndarray,
@@ -316,6 +356,9 @@ def compute_visibility(
     
     # 空间过滤
     scene_pts = _filter_points_fast(points, sensor, center, bbox_dist, half_dims)
+    
+    # 排除框内的点（框内点是目标本身，不参与遮挡计算）
+    scene_pts = _filter_points_outside_bbox(scene_pts, center, half_dims, R)
     
     # 降采样（避免点数过多导致误判）
     if len(scene_pts) > config.MAX_SCENE_POINTS:
