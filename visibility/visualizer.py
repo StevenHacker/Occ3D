@@ -59,9 +59,23 @@ def project_bbox_corners(
     extrinsic: np.ndarray,
     intrinsic: np.ndarray,
     width: int,
-    height: int
+    height: int,
+    min_depth: float = 1.0
 ) -> List[Tuple[int, int]]:
-    """投影bbox角点"""
+    """
+    投影bbox角点
+    
+    Args:
+        bbox_dict: bbox字典
+        extrinsic: 外参矩阵
+        intrinsic: 内参矩阵
+        width: 图像宽度
+        height: 图像高度
+        min_depth: 最小深度阈值，过滤相机后方的点
+    
+    Returns:
+        有效的2D角点列表
+    """
     cx = float(bbox_dict['position']['x'])
     cy = float(bbox_dict['position']['y'])
     cz = float(bbox_dict['position']['z'])
@@ -71,8 +85,8 @@ def project_bbox_corners(
     h = float(bbox_dict['size'][config.SIZE_ORDER['height']])
     
     phi = float(bbox_dict['orientation']['phi'])
-    theta = float(bbox_dict['orientation']['theta'])
-    psi = float(bbox_dict['orientation']['psi'])
+    theta = float(bbox_dict['orientation'].get('theta', 0))
+    psi = float(bbox_dict['orientation'].get('psi', 0))
     
     half_l, half_w, half_h = l/2, w/2, h/2
     corners_local = np.array([
@@ -89,8 +103,25 @@ def project_bbox_corners(
     R = _rotation_matrix_zyx(phi, theta, psi)
     corners_world = (R @ corners_local.T).T + np.array([cx, cy, cz])
     
+    # 先检查bbox中心是否在相机前方
+    center = np.array([cx, cy, cz])
+    center_homo = np.append(center, 1.0)
+    center_cam = np.dot(np.linalg.inv(extrinsic), center_homo)[:3]
+    
+    # 如果中心在相机后方，直接返回空
+    if center_cam[2] < min_depth:
+        return []
+    
     corners_2d = []
     for corner in corners_world:
+        # 转换到相机坐标系
+        corner_homo = np.append(corner, 1.0)
+        corner_cam = np.dot(np.linalg.inv(extrinsic), corner_homo)[:3]
+        
+        # 过滤相机后方的点（深度 < min_depth）
+        if corner_cam[2] < min_depth:
+            continue
+        
         pixel, _ = project_point(corner, extrinsic, intrinsic, width, height)
         if pixel is not None:
             corners_2d.append(pixel)
@@ -161,9 +192,10 @@ def draw_visibility(
             float(bbox_dict['position']['y']),
             float(bbox_dict['position']['z'])
         ])
-        pixel, _ = project_point(center, extrinsic, intrinsic, width, height)
+        pixel, depth = project_point(center, extrinsic, intrinsic, width, height)
         
-        if pixel is None:
+        # 过滤：中心点无效或在相机后方
+        if pixel is None or depth < 1.0:
             continue
         
         u, v = pixel
