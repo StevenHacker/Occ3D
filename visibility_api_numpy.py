@@ -33,21 +33,42 @@ def _sample_visible_surfaces_numpy(
     total_samples: int = 80,
     exclude_bottom: bool = True
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """在可见面上采样（纯NumPy版本）"""
+    """在可见面上采样（纯NumPy版本，带robust处理）"""
     half_l, half_w, half_h = half_dims
+    
+    # 确保尺寸有效（至少1cm）
+    half_l = max(half_l, 0.01)
+    half_w = max(half_w, 0.01)
+    half_h = max(half_h, 0.01)
     
     # 计算传感器在局部坐标系的位置
     sensor_local = R.T @ (sensor - center)
     
-    # 判断可见面
+    # 计算传感器到bbox中心的距离
+    dist_to_center = np.linalg.norm(sensor_local)
+    
+    # 判断可见面（使用阈值避免边界情况）
+    # 如果传感器在bbox内部，则使用距离最远的面
+    threshold = 0.01  # 1cm阈值，避免边界判断问题
+    
     visible = [
-        sensor_local[0] > 0,  # +x
-        sensor_local[0] < 0,  # -x
-        sensor_local[1] > 0,  # +y
-        sensor_local[1] < 0,  # -y
-        sensor_local[2] > 0,  # +z
-        False if exclude_bottom else sensor_local[2] < 0,  # -z
+        sensor_local[0] > threshold,   # +x
+        sensor_local[0] < -threshold,  # -x
+        sensor_local[1] > threshold,   # +y
+        sensor_local[1] < -threshold,  # -y
+        sensor_local[2] > threshold,   # +z
+        False if exclude_bottom else sensor_local[2] < -threshold,  # -z
     ]
+    
+    # 如果没有可见面（传感器在bbox内部或边界上）
+    # 选择传感器局部坐标绝对值最大的方向
+    if not any(visible[:5]):  # 排除底面
+        abs_local = np.abs(sensor_local)
+        max_dim = np.argmax(abs_local)
+        if sensor_local[max_dim] > 0:
+            visible[max_dim * 2] = True      # +方向
+        else:
+            visible[max_dim * 2 + 1] = True  # -方向
     
     # 计算面积
     areas = np.array([
@@ -63,8 +84,12 @@ def _sample_visible_surfaces_numpy(
     visible_areas = areas * np.array(visible, dtype=np.float64)
     total_area = visible_areas.sum()
     
+    # 如果总面积仍然为0（不应该发生），使用最大的面
     if total_area < 1e-6:
-        return np.empty((0, 3)), np.empty(0, dtype=np.int64)
+        max_area_idx = np.argmax(areas[:5])  # 排除底面
+        visible[max_area_idx] = True
+        visible_areas = areas * np.array(visible, dtype=np.float64)
+        total_area = visible_areas.sum()
     
     samples_per_face = np.maximum((total_samples * visible_areas / total_area + 0.5).astype(int), 0)
     samples_per_face[~np.array(visible)] = 0

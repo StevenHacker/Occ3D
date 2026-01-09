@@ -117,20 +117,63 @@ def _rotation_matrix_zyx(phi: float, theta: float, psi: float) -> np.ndarray:
 
 @njit(cache=True)
 def _determine_visible_faces(sensor_local: np.ndarray, exclude_bottom: bool) -> np.ndarray:
-    """判断哪些面朝向传感器"""
+    """
+    判断哪些面朝向传感器
+    
+    改进: 使用阈值避免边界情况，如果没有可见面则选择最可能的面
+    """
     sx, sy, sz = sensor_local[0], sensor_local[1], sensor_local[2]
+    threshold = 0.01  # 1cm阈值
     
     visible = np.array([
-        sx > 0,   # +x面(前)
-        sx < 0,   # -x面(后)
-        sy > 0,   # +y面(左)
-        sy < 0,   # -y面(右)
-        sz > 0,   # +z面(顶)
-        sz < 0,   # -z面(底)
+        sx > threshold,    # +x面
+        sx < -threshold,   # -x面
+        sy > threshold,    # +y面
+        sy < -threshold,   # -y面
+        sz > threshold,    # +z面
+        sz < -threshold,   # -z面
     ])
     
     if exclude_bottom:
         visible[5] = False
+    
+    # 如果没有可见面（传感器在bbox内部或边界上）
+    # 选择传感器局部坐标绝对值最大的方向
+    has_visible = False
+    for i in range(5):  # 排除底面
+        if visible[i]:
+            has_visible = True
+            break
+    
+    if not has_visible:
+        # 找绝对值最大的维度
+        abs_x = abs(sx)
+        abs_y = abs(sy)
+        abs_z = abs(sz)
+        
+        if abs_x >= abs_y and abs_x >= abs_z:
+            if sx >= 0:
+                visible[0] = True
+            else:
+                visible[1] = True
+        elif abs_y >= abs_x and abs_y >= abs_z:
+            if sy >= 0:
+                visible[2] = True
+            else:
+                visible[3] = True
+        else:
+            if sz >= 0:
+                visible[4] = True
+            elif not exclude_bottom:
+                visible[5] = True
+            else:
+                # 如果排除底面且只有底面可见，选择最大的侧面
+                if abs_x >= abs_y:
+                    visible[0] = True if sx >= 0 else True
+                    visible[1] = True if sx < 0 else False
+                else:
+                    visible[2] = True if sy >= 0 else True
+                    visible[3] = True if sy < 0 else False
     
     return visible
 
@@ -215,8 +258,17 @@ def _sample_visible_surfaces(
     total_samples: int,
     exclude_bottom: bool
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """在所有可见面上采样（按面积分配）"""
+    """在所有可见面上采样（按面积分配，带robust处理）"""
     half_l, half_w, half_h = half_dims[0], half_dims[1], half_dims[2]
+    
+    # 确保尺寸有效（至少1cm）
+    min_size = 0.01
+    if half_l < min_size:
+        half_l = min_size
+    if half_w < min_size:
+        half_w = min_size
+    if half_h < min_size:
+        half_h = min_size
     
     # 计算传感器在局部坐标系的位置
     diff = np.empty(3, dtype=np.float64)
@@ -228,7 +280,7 @@ def _sample_visible_surfaces(
     for i in range(3):
         sensor_local[i] = R[0, i] * diff[0] + R[1, i] * diff[1] + R[2, i] * diff[2]
     
-    # 判断可见面
+    # 判断可见面 (改进版，处理边界情况)
     visible_faces = _determine_visible_faces(sensor_local, exclude_bottom)
     
     # 计算各面面积，按比例分配采样数
@@ -239,8 +291,16 @@ def _sample_visible_surfaces(
         if visible_faces[i]:
             total_visible_area += areas[i]
     
+    # 如果总面积仍然为0，强制选择最大的面（不应该发生，但作为保险）
     if total_visible_area < 1e-6:
-        return np.empty((0, 3), dtype=np.float64), np.empty(0, dtype=np.int64)
+        max_area_idx = 0
+        max_area = areas[0]
+        for i in range(1, 5):  # 排除底面
+            if areas[i] > max_area:
+                max_area = areas[i]
+                max_area_idx = i
+        visible_faces[max_area_idx] = True
+        total_visible_area = areas[max_area_idx]
     
     samples_per_face = np.zeros(6, dtype=np.int64)
     for i in range(6):
