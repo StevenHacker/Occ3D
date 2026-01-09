@@ -138,7 +138,12 @@ def build_ego_to_lidar(translation, rotation):
 
 
 def transform_bbox(bbox, T):
-    """转换bbox到lidar坐标系"""
+    """
+    转换bbox到lidar坐标系
+    
+    注意：如果T包含旋转，需要同时转换朝向角
+    """
+    # 转换位置
     point = np.array([
         float(bbox['position']['x']),
         float(bbox['position']['y']),
@@ -155,11 +160,34 @@ def transform_bbox(bbox, T):
         'z': float(point_lidar[2])
     }
     
-    # 转换尺寸和角度为float
+    # 转换尺寸为float
     if 'size' in bbox_new:
         bbox_new['size'] = [float(s) for s in bbox_new['size']]
+    
+    # 转换朝向角
     if 'orientation' in bbox_new:
-        bbox_new['orientation'] = {k: float(v) for k, v in bbox_new['orientation'].items()}
+        ori = bbox_new['orientation']
+        phi = float(ori.get('phi', 0))
+        theta = float(ori.get('theta', 0))
+        psi = float(ori.get('psi', 0))
+        
+        # 检查T是否包含旋转（非单位矩阵）
+        R_transform = T[:3, :3]
+        if not np.allclose(R_transform, np.eye(3), atol=1e-6):
+            # 将bbox的旋转与变换矩阵的旋转组合
+            # bbox在ego坐标系中的旋转
+            R_bbox_ego = R.from_euler('ZYX', [phi, theta, psi]).as_matrix()
+            # 组合旋转：先bbox旋转，再坐标系变换
+            R_bbox_lidar = R_transform @ R_bbox_ego
+            # 提取新的欧拉角
+            new_euler = R.from_matrix(R_bbox_lidar).as_euler('ZYX')
+            phi, theta, psi = new_euler[0], new_euler[1], new_euler[2]
+        
+        bbox_new['orientation'] = {
+            'phi': float(phi),
+            'theta': float(theta),
+            'psi': float(psi)
+        }
     
     return bbox_new
 
