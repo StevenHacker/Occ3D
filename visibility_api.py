@@ -52,14 +52,26 @@ except ImportError:
 # ============================================================
 # Numba JIT 编译支持（可选，用于加速）
 # ============================================================
-try:
-    from numba import njit
-    HAS_NUMBA = True
-except ImportError:
+import os
+
+# 可以通过环境变量 DISABLE_NUMBA=1 强制禁用
+FORCE_DISABLE_NUMBA = os.environ.get('DISABLE_NUMBA', '0') == '1'
+
+if FORCE_DISABLE_NUMBA:
     HAS_NUMBA = False
     def njit(*args, **kwargs):
         def decorator(func): return func
         return decorator if not (args and callable(args[0])) else args[0]
+    print("[INFO] Numba已禁用 (DISABLE_NUMBA=1)")
+else:
+    try:
+        from numba import njit
+        HAS_NUMBA = True
+    except ImportError:
+        HAS_NUMBA = False
+        def njit(*args, **kwargs):
+            def decorator(func): return func
+            return decorator if not (args and callable(args[0])) else args[0]
 
 
 # ============================================================

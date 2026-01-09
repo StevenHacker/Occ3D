@@ -34,14 +34,40 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 from tqdm import tqdm
 
-# 导入可见性计算接口
-from visibility_api import (
-    compute_frame_visibility,
-    compute_bbox_visibility,
-    classify_visibility,
-    visualize_visibility,
-    HAS_VISUALIZER
-)
+# 导入可见性计算接口 (优先使用Numba版本，失败时fallback到纯NumPy)
+import os
+
+# 可以通过环境变量强制使用纯NumPy版本
+USE_NUMPY_ONLY = os.environ.get('USE_NUMPY_ONLY', '0') == '1'
+
+if USE_NUMPY_ONLY:
+    print("[INFO] 使用纯NumPy版本 (USE_NUMPY_ONLY=1)")
+    from visibility_api_numpy import (
+        compute_frame_visibility,
+        compute_bbox_visibility,
+        classify_visibility
+    )
+    HAS_VISUALIZER = False
+    visualize_visibility = None
+else:
+    try:
+        from visibility_api import (
+            compute_frame_visibility,
+            compute_bbox_visibility,
+            classify_visibility,
+            visualize_visibility,
+            HAS_VISUALIZER
+        )
+    except Exception as e:
+        print(f"[警告] Numba版本加载失败: {e}")
+        print("[INFO] 自动切换到纯NumPy版本")
+        from visibility_api_numpy import (
+            compute_frame_visibility,
+            compute_bbox_visibility,
+            classify_visibility
+        )
+        HAS_VISUALIZER = False
+        visualize_visibility = None
 
 # cv2 用于可视化
 try:
