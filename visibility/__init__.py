@@ -22,8 +22,8 @@ from .config import (
     SIDE_FACES_ONLY,
     ANGLE_THRESH_DEG,
     MIN_BLOCKERS,
-    MAX_SCENE_POINTS,
     SPATIAL_FILTER,
+    SPATIAL_FILTER_ANGLE,
     VISIBILITY_THRESHOLDS,
     get_config_dict,
     print_config

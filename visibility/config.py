@@ -50,14 +50,12 @@ RAY_END_MARGIN = 0.3
 # 性能参数
 # ============================================================
 
-# 场景点云最大采样数
-MAX_SCENE_POINTS = 8000
-
 # 空间过滤：只检查传感器→bbox方向上的点云
-# 对于真实LiDAR点云效果较好，随机点云可关闭
-SPATIAL_FILTER = False
+# 开启后大幅减少需要检查的点数
+SPATIAL_FILTER = True
 
 # 空间过滤扩展角度（度）
+# 只保留与bbox方向夹角小于此值的点
 SPATIAL_FILTER_ANGLE = 20.0
 
 
@@ -140,7 +138,6 @@ def get_config_dict():
         'side_faces_only': SIDE_FACES_ONLY,
         'angle_thresh_deg': ANGLE_THRESH_DEG,
         'min_blockers': MIN_BLOCKERS,
-        'max_scene_points': MAX_SCENE_POINTS,
         'ray_start_margin': RAY_START_MARGIN,
         'ray_end_margin': RAY_END_MARGIN,
         'spatial_filter': SPATIAL_FILTER,
@@ -161,10 +158,9 @@ def print_config():
     print(f"  最少遮挡点数: {MIN_BLOCKERS}")
     print(f"  射线起点排除: {RAY_START_MARGIN}m")
     print(f"  射线终点排除: {RAY_END_MARGIN}m")
-    print(f"性能优化参数:")
-    print(f"  空间过滤: {SPATIAL_FILTER}")
+    print(f"空间过滤:")
+    print(f"  开启: {SPATIAL_FILTER}")
     print(f"  过滤角度: ±{SPATIAL_FILTER_ANGLE}°")
-    print(f"  最大点数: {MAX_SCENE_POINTS}")
     print("=" * 50)
 
 
