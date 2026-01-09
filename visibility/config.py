@@ -12,10 +12,11 @@
 # ============================================================
 
 # 总采样点数（会按面积分配到各可见面）
-TOTAL_SAMPLES = 80
+TOTAL_SAMPLES = 60
 
-# 是否排除底面（车辆底面通常不可见）
-EXCLUDE_BOTTOM = True
+# 只考虑侧面（前后左右），不考虑顶面和底面
+# 对于车辆等物体，顶底面通常不重要
+SIDE_FACES_ONLY = True
 
 # 最小有效尺寸（米），小于此值的尺寸会被强制设为此值
 MIN_SIZE = 0.01
@@ -50,8 +51,14 @@ RAY_END_MARGIN = 0.3
 # ============================================================
 
 # 场景点云最大采样数
-# 点云数量超过此值时会随机降采样
-MAX_SCENE_POINTS = 15000
+MAX_SCENE_POINTS = 8000
+
+# 空间过滤：只检查传感器→bbox方向上的点云
+# 对于真实LiDAR点云效果较好，随机点云可关闭
+SPATIAL_FILTER = False
+
+# 空间过滤扩展角度（度）
+SPATIAL_FILTER_ANGLE = 20.0
 
 
 # ============================================================
@@ -130,12 +137,14 @@ def get_config_dict():
     """返回所有配置作为字典"""
     return {
         'total_samples': TOTAL_SAMPLES,
-        'exclude_bottom': EXCLUDE_BOTTOM,
+        'side_faces_only': SIDE_FACES_ONLY,
         'angle_thresh_deg': ANGLE_THRESH_DEG,
         'min_blockers': MIN_BLOCKERS,
         'max_scene_points': MAX_SCENE_POINTS,
         'ray_start_margin': RAY_START_MARGIN,
         'ray_end_margin': RAY_END_MARGIN,
+        'spatial_filter': SPATIAL_FILTER,
+        'spatial_filter_angle': SPATIAL_FILTER_ANGLE,
     }
 
 
@@ -146,14 +155,16 @@ def print_config():
     print("=" * 50)
     print(f"采样参数:")
     print(f"  总采样点数: {TOTAL_SAMPLES}")
-    print(f"  排除底面: {EXCLUDE_BOTTOM}")
+    print(f"  只考虑侧面: {SIDE_FACES_ONLY}")
     print(f"射线检测参数:")
     print(f"  角度阈值: {ANGLE_THRESH_DEG}°")
     print(f"  最少遮挡点数: {MIN_BLOCKERS}")
     print(f"  射线起点排除: {RAY_START_MARGIN}m")
     print(f"  射线终点排除: {RAY_END_MARGIN}m")
-    print(f"性能参数:")
-    print(f"  场景点云最大采样: {MAX_SCENE_POINTS}")
+    print(f"性能优化参数:")
+    print(f"  空间过滤: {SPATIAL_FILTER}")
+    print(f"  过滤角度: ±{SPATIAL_FILTER_ANGLE}°")
+    print(f"  最大点数: {MAX_SCENE_POINTS}")
     print("=" * 50)
 
 

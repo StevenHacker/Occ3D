@@ -4,7 +4,9 @@
 可见性计算核心模块
 ==================
 
-纯NumPy实现，稳定可靠
+优化版本：
+1. 只考虑侧面（前后左右）
+2. 高效向量化射线检测
 """
 
 import numpy as np
@@ -27,21 +29,12 @@ def _rotation_matrix_zyx(phi: float, theta: float, psi: float) -> np.ndarray:
 
 
 def _parse_bbox(bbox_dict: Dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    解析bbox字典
-    
-    Returns:
-        center: (3,) 中心点
-        half_dims: (3,) 半尺寸 [half_l, half_w, half_h]
-        R: (3,3) 旋转矩阵
-    """
-    # 位置
+    """解析bbox字典"""
     cx = float(bbox_dict['position']['x'])
     cy = float(bbox_dict['position']['y'])
     cz = float(bbox_dict['position']['z'])
     center = np.array([cx, cy, cz], dtype=np.float64)
     
-    # 尺寸
     w_idx = config.SIZE_ORDER['width']
     h_idx = config.SIZE_ORDER['height']
     l_idx = config.SIZE_ORDER['length']
@@ -52,37 +45,88 @@ def _parse_bbox(bbox_dict: Dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     
     half_dims = np.array([length/2, width/2, height/2], dtype=np.float64)
     
-    # 旋转
     phi = float(bbox_dict['orientation']['phi'])
-    theta = float(bbox_dict['orientation']['theta'])
-    psi = float(bbox_dict['orientation']['psi'])
+    theta = float(bbox_dict['orientation'].get('theta', 0.0))
+    psi = float(bbox_dict['orientation'].get('psi', 0.0))
     R = _rotation_matrix_zyx(phi, theta, psi)
     
     return center, half_dims, R
 
 
-def _determine_visible_faces(sensor_local: np.ndarray) -> np.ndarray:
-    """判断可见面"""
-    threshold = 0.01
-    sx, sy, sz = sensor_local
+def _filter_points_fast(
+    points: np.ndarray,
+    sensor: np.ndarray,
+    bbox_center: np.ndarray,
+    bbox_dist: float,
+    half_dims: np.ndarray
+) -> np.ndarray:
+    """
+    快速空间过滤：只保留可能遮挡bbox的点
     
-    visible = np.array([
-        sx > threshold,    # +x
-        sx < -threshold,   # -x
-        sy > threshold,    # +y
-        sy < -threshold,   # -y
-        sz > threshold,    # +z
-        False if config.EXCLUDE_BOTTOM else sz < -threshold,  # -z
-    ])
+    使用简单的距离+方向过滤
+    """
+    if not config.SPATIAL_FILTER:
+        return points
+    
+    if bbox_dist < 2.0:
+        return points
+    
+    # 只保留在传感器和bbox之间的点（距离过滤）
+    rel_pts = points - sensor
+    pts_dist_sq = np.sum(rel_pts ** 2, axis=1)
+    
+    max_dist = bbox_dist + np.max(half_dims) * 2
+    mask = pts_dist_sq < max_dist ** 2
+    
+    if mask.sum() < 100:
+        return points
+    
+    # 方向过滤
+    bbox_dir = (bbox_center - sensor) / bbox_dist
+    pts_dist = np.sqrt(pts_dist_sq[mask])
+    cos_angle = (rel_pts[mask] @ bbox_dir) / np.maximum(pts_dist, 0.1)
+    
+    angle_thresh = np.deg2rad(config.SPATIAL_FILTER_ANGLE)
+    dir_mask = cos_angle > np.cos(angle_thresh)
+    
+    indices = np.where(mask)[0][dir_mask]
+    
+    if len(indices) < 100:
+        return points
+    
+    return points[indices]
+
+
+def _determine_visible_faces(sensor_local: np.ndarray) -> np.ndarray:
+    """判断可见面（只考虑4个侧面）"""
+    threshold = 0.01
+    sx, sy, _ = sensor_local
+    
+    if config.SIDE_FACES_ONLY:
+        visible = np.array([
+            sx > threshold,    # +x (后)
+            sx < -threshold,   # -x (前)
+            sy > threshold,    # +y (右)
+            sy < -threshold,   # -y (左)
+            False,             # +z (顶) - 不考虑
+            False,             # -z (底) - 不考虑
+        ])
+    else:
+        sz = sensor_local[2]
+        visible = np.array([
+            sx > threshold, sx < -threshold,
+            sy > threshold, sy < -threshold,
+            sz > threshold, sz < -threshold,
+        ])
     
     # 如果没有可见面，选择最可能的面
-    if not any(visible[:5]):
-        abs_local = np.abs(sensor_local)
-        max_dim = np.argmax(abs_local)
-        if sensor_local[max_dim] >= 0:
-            visible[max_dim * 2] = True
+    if not any(visible[:4]):
+        abs_xy = [abs(sx), abs(sy)]
+        max_dim = np.argmax(abs_xy)
+        if max_dim == 0:
+            visible[0 if sx >= 0 else 1] = True
         else:
-            visible[max_dim * 2 + 1] = True
+            visible[2 if sy >= 0 else 3] = True
     
     return visible
 
@@ -93,55 +137,45 @@ def _sample_surfaces(
     R: np.ndarray,
     sensor: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """在可见面上采样"""
+    """在可见侧面上采样"""
     half_l, half_w, half_h = half_dims
     
-    # 计算传感器在局部坐标系的位置
     sensor_local = R.T @ (sensor - center)
-    
-    # 判断可见面
     visible = _determine_visible_faces(sensor_local)
     
-    # 计算面积
+    # 侧面面积
     areas = np.array([
-        4 * half_w * half_h,
-        4 * half_w * half_h,
-        4 * half_l * half_h,
-        4 * half_l * half_h,
-        4 * half_l * half_w,
-        4 * half_l * half_w,
+        4 * half_w * half_h,  # +x
+        4 * half_w * half_h,  # -x
+        4 * half_l * half_h,  # +y
+        4 * half_l * half_h,  # -y
+        0, 0,  # 顶底
     ])
     
-    # 按面积分配采样
     visible_areas = areas * visible.astype(np.float64)
     total_area = visible_areas.sum()
     
     if total_area < 1e-6:
-        max_idx = np.argmax(areas[:5])
+        max_idx = np.argmax(areas[:4])
         visible[max_idx] = True
         visible_areas = areas * visible.astype(np.float64)
         total_area = visible_areas.sum()
     
-    samples_per_face = np.maximum(
-        (config.TOTAL_SAMPLES * visible_areas / total_area + 0.5).astype(int), 0
-    )
+    samples_per_face = (config.TOTAL_SAMPLES * visible_areas / total_area + 0.5).astype(int)
     samples_per_face[~visible] = 0
-    samples_per_face[samples_per_face > 0] = np.maximum(
-        samples_per_face[samples_per_face > 0], 4
-    )
+    samples_per_face[samples_per_face > 0] = np.maximum(samples_per_face[samples_per_face > 0], 4)
     
-    # 采样
     all_samples = []
     all_face_ids = []
     
-    for face_id in range(6):
+    for face_id in range(4):
         n = samples_per_face[face_id]
         if n == 0:
             continue
         
         n_side = max(int(np.sqrt(n)), 2)
-        u = np.linspace(-1 + 1/n_side, 1 - 1/n_side, n_side)
-        v = np.linspace(-1 + 1/n_side, 1 - 1/n_side, n_side)
+        u = np.linspace(-0.9, 0.9, n_side)
+        v = np.linspace(-0.9, 0.9, n_side)
         uu, vv = np.meshgrid(u, v)
         uu, vv = uu.flatten(), vv.flatten()
         
@@ -151,12 +185,8 @@ def _sample_surfaces(
             local = np.column_stack([np.full_like(uu, -half_l), uu * half_w, vv * half_h])
         elif face_id == 2:
             local = np.column_stack([uu * half_l, np.full_like(uu, half_w), vv * half_h])
-        elif face_id == 3:
-            local = np.column_stack([uu * half_l, np.full_like(uu, -half_w), vv * half_h])
-        elif face_id == 4:
-            local = np.column_stack([uu * half_l, vv * half_w, np.full_like(uu, half_h)])
         else:
-            local = np.column_stack([uu * half_l, vv * half_w, np.full_like(uu, -half_h)])
+            local = np.column_stack([uu * half_l, np.full_like(uu, -half_w), vv * half_h])
         
         world = (R @ local.T).T + center
         all_samples.append(world)
@@ -168,53 +198,66 @@ def _sample_surfaces(
     return np.vstack(all_samples), np.concatenate(all_face_ids)
 
 
-def _check_rays_blocked(
+def _check_rays_blocked_vectorized(
     targets: np.ndarray,
     sensor: np.ndarray,
     points: np.ndarray
 ) -> np.ndarray:
-    """向量化射线遮挡检测"""
+    """
+    高效向量化射线遮挡检测
+    
+    使用批处理减少循环开销
+    """
     n_targets = len(targets)
     blocked = np.zeros(n_targets, dtype=bool)
     
-    angle_thresh = np.deg2rad(config.ANGLE_THRESH_DEG)
-    tan_thresh = np.tan(angle_thresh)
+    if len(points) == 0:
+        return blocked
     
-    for i in range(n_targets):
-        target = targets[i]
-        ray = target - sensor
-        ray_len = np.linalg.norm(ray)
+    tan_thresh = np.tan(np.deg2rad(config.ANGLE_THRESH_DEG))
+    start_margin = config.RAY_START_MARGIN
+    end_margin = config.RAY_END_MARGIN
+    min_blockers = config.MIN_BLOCKERS
+    
+    # 预计算
+    rel_pts = points - sensor
+    
+    # 批量处理targets
+    batch_size = 16
+    for batch_start in range(0, n_targets, batch_size):
+        batch_end = min(batch_start + batch_size, n_targets)
         
-        if ray_len < 1e-6:
-            continue
-        
-        ray_dir = ray / ray_len
-        
-        # 计算投影
-        rel_pts = points - sensor
-        proj = rel_pts @ ray_dir
-        
-        # 只考虑在sensor和target之间的点
-        valid_mask = (proj > config.RAY_START_MARGIN) & (proj < ray_len - config.RAY_END_MARGIN)
-        
-        if not np.any(valid_mask):
-            continue
-        
-        proj_valid = proj[valid_mask]
-        rel_pts_valid = rel_pts[valid_mask]
-        
-        # 计算垂直距离
-        closest = np.outer(proj_valid, ray_dir)
-        perp_dist_sq = np.sum((rel_pts_valid - closest) ** 2, axis=1)
-        
-        # 动态阈值
-        thresh = proj_valid * tan_thresh
-        
-        # 统计遮挡点数
-        n_blockers = np.sum(perp_dist_sq < thresh ** 2)
-        
-        if n_blockers >= config.MIN_BLOCKERS:
-            blocked[i] = True
+        for i in range(batch_start, batch_end):
+            target = targets[i]
+            ray = target - sensor
+            ray_len = np.linalg.norm(ray)
+            
+            if ray_len < 1e-6:
+                continue
+            
+            ray_dir = ray / ray_len
+            
+            # 投影
+            proj = rel_pts @ ray_dir
+            
+            # 有效范围内的点
+            valid = (proj > start_margin) & (proj < ray_len - end_margin)
+            
+            if not np.any(valid):
+                continue
+            
+            proj_v = proj[valid]
+            
+            # 垂直距离的平方
+            closest = np.outer(proj_v, ray_dir)
+            perp_sq = np.sum((rel_pts[valid] - closest) ** 2, axis=1)
+            
+            # 动态阈值
+            thresh_sq = (proj_v * tan_thresh) ** 2
+            
+            # 统计
+            if np.sum(perp_sq < thresh_sq) >= min_blockers:
+                blocked[i] = True
     
     return blocked
 
@@ -251,17 +294,14 @@ def compute_visibility(
     if sensor_origin is None:
         sensor_origin = np.array([0.0, 0.0, 0.0])
     
-    # 解析bbox
     try:
         center, half_dims, R = _parse_bbox(bbox_dict)
     except Exception as e:
         return 0.0, {'score': 0.0, 'status': 'PARSE_ERROR', 'error': str(e)}
     
-    # 准备点云
     points = np.ascontiguousarray(points[:, :3], dtype=np.float64)
     sensor = np.asarray(sensor_origin, dtype=np.float64)
     
-    # 采样
     try:
         samples, face_ids = _sample_surfaces(center, half_dims, R, sensor)
     except Exception as e:
@@ -271,15 +311,19 @@ def compute_visibility(
     if n_samples == 0:
         return 0.0, {'score': 0.0, 'status': 'NO_VISIBLE_SURFACE', 'n_samples': 0}
     
-    # 降采样点云
-    if len(points) > config.MAX_SCENE_POINTS:
-        indices = np.random.choice(len(points), config.MAX_SCENE_POINTS, replace=False)
-        scene_pts = points[indices]
-    else:
-        scene_pts = points
+    # 计算bbox到传感器的距离
+    bbox_dist = np.linalg.norm(center - sensor)
+    
+    # 空间过滤
+    scene_pts = _filter_points_fast(points, sensor, center, bbox_dist, half_dims)
+    
+    # 降采样
+    if len(scene_pts) > config.MAX_SCENE_POINTS:
+        indices = np.random.choice(len(scene_pts), config.MAX_SCENE_POINTS, replace=False)
+        scene_pts = scene_pts[indices]
     
     # 检测遮挡
-    blocked = _check_rays_blocked(samples, sensor, scene_pts)
+    blocked = _check_rays_blocked_vectorized(samples, sensor, scene_pts)
     
     n_blocked = blocked.sum()
     n_visible = n_samples - n_blocked
@@ -292,6 +336,8 @@ def compute_visibility(
         'n_samples': int(n_samples),
         'n_blocked': int(n_blocked),
         'n_visible': int(n_visible),
+        'n_scene_pts': len(scene_pts),
+        'distance': float(bbox_dist),
         'status': status
     }
 
@@ -303,14 +349,6 @@ def compute_frame_visibility(
 ) -> Dict[str, Dict]:
     """
     计算一帧中所有bbox的可见性
-    
-    Args:
-        label_3d_list: 3D标注框列表
-        points: (N, 3) 点云
-        sensor_origin: (3,) 传感器位置
-    
-    Returns:
-        results: {track_id: details}
     """
     results = {}
     

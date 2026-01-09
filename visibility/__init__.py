@@ -16,12 +16,14 @@
     results = compute_frame_visibility(label_3d_list, points)
 """
 
+from . import config
 from .config import (
     TOTAL_SAMPLES,
-    EXCLUDE_BOTTOM,
+    SIDE_FACES_ONLY,
     ANGLE_THRESH_DEG,
     MIN_BLOCKERS,
     MAX_SCENE_POINTS,
+    SPATIAL_FILTER,
     VISIBILITY_THRESHOLDS,
     get_config_dict,
     print_config
