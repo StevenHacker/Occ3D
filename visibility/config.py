@@ -50,9 +50,14 @@ RAY_END_MARGIN = 0.3
 # 性能参数
 # ============================================================
 
-# 场景点云最大数量（降采样）
-# 点数过多会增加误判率，建议保留
+# 场景点云最大数量（触发降采样的阈值）
 MAX_SCENE_POINTS = 15000
+
+# 体素降采样大小（米）
+# 将空间划分为此大小的格子，每格保留一个点
+# 较小的值 -> 保留更多点，更精确
+# 较大的值 -> 点更少，更快
+VOXEL_SIZE = 0.15
 
 # 空间过滤：只检查传感器→bbox方向上的点云
 # 注意：开启后可能导致可见性偏低，建议先关闭测试
@@ -143,6 +148,7 @@ def get_config_dict():
         'angle_thresh_deg': ANGLE_THRESH_DEG,
         'min_blockers': MIN_BLOCKERS,
         'max_scene_points': MAX_SCENE_POINTS,
+        'voxel_size': VOXEL_SIZE,
         'ray_start_margin': RAY_START_MARGIN,
         'ray_end_margin': RAY_END_MARGIN,
         'spatial_filter': SPATIAL_FILTER,
@@ -163,8 +169,9 @@ def print_config():
     print(f"  最少遮挡点数: {MIN_BLOCKERS}")
     print(f"  射线起点排除: {RAY_START_MARGIN}m")
     print(f"  射线终点排除: {RAY_END_MARGIN}m")
-    print(f"性能参数:")
-    print(f"  最大点云数: {MAX_SCENE_POINTS}")
+    print(f"降采样参数:")
+    print(f"  触发阈值: {MAX_SCENE_POINTS}点")
+    print(f"  体素大小: {VOXEL_SIZE}m")
     print(f"  空间过滤: {SPATIAL_FILTER}")
     print("=" * 50)
 

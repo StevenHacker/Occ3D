@@ -53,6 +53,55 @@ def _parse_bbox(bbox_dict: Dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     return center, half_dims, R
 
 
+def _voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
+    """
+    体素降采样
+    
+    将空间划分为固定大小的体素格子，每个格子内只保留一个点（质心）
+    
+    Args:
+        points: (N, 3) 点云
+        voxel_size: 体素大小（米）
+    
+    Returns:
+        降采样后的点云
+    """
+    if len(points) == 0 or voxel_size <= 0:
+        return points
+    
+    # 计算每个点所属的体素索引
+    voxel_indices = np.floor(points / voxel_size).astype(np.int32)
+    
+    # 将3D索引转换为唯一的1D键
+    # 使用大质数避免碰撞
+    keys = (voxel_indices[:, 0] * 73856093 ^ 
+            voxel_indices[:, 1] * 19349663 ^ 
+            voxel_indices[:, 2] * 83492791)
+    
+    # 找到每个体素的第一个点（或计算质心）
+    unique_keys, inverse_indices = np.unique(keys, return_inverse=True)
+    
+    # 方法1：取每个体素的第一个点（快速）
+    # first_indices = np.zeros(len(unique_keys), dtype=np.int32)
+    # for i, key in enumerate(keys):
+    #     idx = inverse_indices[i]
+    #     if first_indices[idx] == 0 or i < first_indices[idx]:
+    #         first_indices[idx] = i
+    # return points[first_indices]
+    
+    # 方法2：计算每个体素的质心（更准确）
+    n_voxels = len(unique_keys)
+    voxel_sums = np.zeros((n_voxels, 3), dtype=np.float64)
+    voxel_counts = np.zeros(n_voxels, dtype=np.int32)
+    
+    np.add.at(voxel_sums, inverse_indices, points)
+    np.add.at(voxel_counts, inverse_indices, 1)
+    
+    centroids = voxel_sums / voxel_counts[:, np.newaxis]
+    
+    return centroids
+
+
 def _filter_points_outside_bbox(
     points: np.ndarray,
     center: np.ndarray,
@@ -360,10 +409,9 @@ def compute_visibility(
     # 排除框内的点（框内点是目标本身，不参与遮挡计算）
     scene_pts = _filter_points_outside_bbox(scene_pts, center, half_dims, R)
     
-    # 降采样（避免点数过多导致误判）
+    # 体素降采样（均匀稳定）
     if len(scene_pts) > config.MAX_SCENE_POINTS:
-        indices = np.random.choice(len(scene_pts), config.MAX_SCENE_POINTS, replace=False)
-        scene_pts = scene_pts[indices]
+        scene_pts = _voxel_downsample(scene_pts, config.VOXEL_SIZE)
     
     # 检测遮挡
     blocked = _check_rays_blocked_vectorized(samples, sensor, scene_pts)
