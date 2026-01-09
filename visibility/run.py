@@ -5,6 +5,8 @@
 ================
 
 使用方法:
+    python run.py --clip_path /path/to/clip --visualize
+    或
     python -m visibility.run --clip_path /path/to/clip --visualize
 """
 
@@ -18,14 +20,26 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 from tqdm import tqdm
 
-# 导入可见性库
-from . import config
-from .core import compute_frame_visibility
-try:
-    from .visualizer import draw_visibility, HAS_CV2
-except ImportError:
-    HAS_CV2 = False
-    draw_visibility = None
+# 支持直接运行和模块运行两种方式
+if __name__ == '__main__' and __package__ is None:
+    # 直接运行时，添加父目录到路径
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import visibility.config as config
+    from visibility.core import compute_frame_visibility
+    try:
+        from visibility.visualizer import draw_visibility, HAS_CV2
+    except ImportError:
+        HAS_CV2 = False
+        draw_visibility = None
+else:
+    # 作为模块运行
+    from . import config
+    from .core import compute_frame_visibility
+    try:
+        from .visualizer import draw_visibility, HAS_CV2
+    except ImportError:
+        HAS_CV2 = False
+        draw_visibility = None
 
 try:
     import cv2
@@ -296,7 +310,7 @@ def process_clip(clip_path, visualize=False, output_json=False, max_frames=None)
 
 def main():
     parser = argparse.ArgumentParser(description='可见性计算')
-    parser.add_argument('--clip_path', type=str, required=True, help='数据路径')
+    parser.add_argument('--clip_path', type=str, default=None, help='数据路径')
     parser.add_argument('--visualize', action='store_true', help='生成可视化')
     parser.add_argument('--output_json', action='store_true', help='输出JSON')
     parser.add_argument('--max_frames', type=int, default=None, help='最大帧数')
@@ -307,6 +321,9 @@ def main():
     if args.print_config:
         config.print_config()
         return
+    
+    if args.clip_path is None:
+        parser.error("请提供 --clip_path 参数")
     
     if not os.path.exists(args.clip_path):
         print(f"[错误] 路径不存在: {args.clip_path}")
