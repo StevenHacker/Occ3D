@@ -314,8 +314,13 @@ def compute_visibility(
     # 计算bbox到传感器的距离
     bbox_dist = np.linalg.norm(center - sensor)
     
-    # 空间过滤：只保留bbox方向上的点（不降采样）
+    # 空间过滤
     scene_pts = _filter_points_fast(points, sensor, center, bbox_dist, half_dims)
+    
+    # 降采样（避免点数过多导致误判）
+    if len(scene_pts) > config.MAX_SCENE_POINTS:
+        indices = np.random.choice(len(scene_pts), config.MAX_SCENE_POINTS, replace=False)
+        scene_pts = scene_pts[indices]
     
     # 检测遮挡
     blocked = _check_rays_blocked_vectorized(samples, sensor, scene_pts)

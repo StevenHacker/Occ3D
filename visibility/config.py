@@ -28,14 +28,14 @@ MIN_SIZE = 0.01
 
 # 射线角度阈值（度）
 # 用于定义射线的"宽度"，适应点云稀疏性
-# 较小的值 -> 更严格的遮挡判断
-# 较大的值 -> 更宽松的遮挡判断
-ANGLE_THRESH_DEG = 0.5
+# 较小的值 -> 更严格的遮挡判断（不容易误判为遮挡）
+# 较大的值 -> 更宽松的遮挡判断（容易判为遮挡）
+ANGLE_THRESH_DEG = 0.3  # 减小，更严格
 
 # 最少遮挡点数
 # 需要至少这么多点在射线锥体内才判定为遮挡
-# 用于避免单个噪声点造成误判
-MIN_BLOCKERS = 3
+# 值越大，越不容易判定为遮挡
+MIN_BLOCKERS = 5  # 增大，需要更多点才判定遮挡
 
 # 射线起点排除距离（米）
 # 排除传感器附近的点，避免噪声干扰
@@ -50,13 +50,17 @@ RAY_END_MARGIN = 0.3
 # 性能参数
 # ============================================================
 
+# 场景点云最大数量（降采样）
+# 点数过多会增加误判率，建议保留
+MAX_SCENE_POINTS = 15000
+
 # 空间过滤：只检查传感器→bbox方向上的点云
-# 开启后大幅减少需要检查的点数
-SPATIAL_FILTER = True
+# 注意：开启后可能导致可见性偏低，建议先关闭测试
+SPATIAL_FILTER = False
 
 # 空间过滤扩展角度（度）
 # 只保留与bbox方向夹角小于此值的点
-SPATIAL_FILTER_ANGLE = 20.0
+SPATIAL_FILTER_ANGLE = 25.0
 
 
 # ============================================================
@@ -138,6 +142,7 @@ def get_config_dict():
         'side_faces_only': SIDE_FACES_ONLY,
         'angle_thresh_deg': ANGLE_THRESH_DEG,
         'min_blockers': MIN_BLOCKERS,
+        'max_scene_points': MAX_SCENE_POINTS,
         'ray_start_margin': RAY_START_MARGIN,
         'ray_end_margin': RAY_END_MARGIN,
         'spatial_filter': SPATIAL_FILTER,
@@ -158,9 +163,9 @@ def print_config():
     print(f"  最少遮挡点数: {MIN_BLOCKERS}")
     print(f"  射线起点排除: {RAY_START_MARGIN}m")
     print(f"  射线终点排除: {RAY_END_MARGIN}m")
-    print(f"空间过滤:")
-    print(f"  开启: {SPATIAL_FILTER}")
-    print(f"  过滤角度: ±{SPATIAL_FILTER_ANGLE}°")
+    print(f"性能参数:")
+    print(f"  最大点云数: {MAX_SCENE_POINTS}")
+    print(f"  空间过滤: {SPATIAL_FILTER}")
     print("=" * 50)
 
 
