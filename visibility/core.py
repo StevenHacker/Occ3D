@@ -325,14 +325,38 @@ def compute_visibility(
     # 检测遮挡
     blocked = _check_rays_blocked_vectorized(samples, sensor, scene_pts)
     
+    # 按面计算可见性，取最高值
+    face_names = ['+x(后)', '-x(前)', '+y(右)', '-y(左)']
+    face_visibility = {}
+    max_visibility = 0.0
+    best_face = None
+    
+    for fid in range(4):
+        mask = face_ids == fid
+        if not np.any(mask):
+            continue
+        
+        face_samples = mask.sum()
+        face_blocked = blocked[mask].sum()
+        face_vis = (face_samples - face_blocked) / face_samples
+        face_visibility[face_names[fid]] = float(face_vis)
+        
+        if face_vis > max_visibility:
+            max_visibility = face_vis
+            best_face = face_names[fid]
+    
+    # 使用最高可见面的可见性作为最终分数
+    visibility = max_visibility
+    
     n_blocked = blocked.sum()
     n_visible = n_samples - n_blocked
-    visibility = n_visible / n_samples
     
     status = classify_visibility(visibility)
     
     return float(visibility), {
         'score': float(visibility),
+        'best_face': best_face,
+        'face_visibility': face_visibility,
         'n_samples': int(n_samples),
         'n_blocked': int(n_blocked),
         'n_visible': int(n_visible),
